@@ -1,4 +1,5 @@
 .idea/
 .env
+uv.lock
 data/raw/*
 **/__pycache__/*
