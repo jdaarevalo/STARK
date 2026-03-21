@@ -32,14 +32,15 @@ def process_sleep_jsons():
         with open(file, "r") as f:
             data = json.load(f)
             # Extract high-level metrics for J.A.R.V.I.S.
+            dto = data.get("dailySleepDTO") or {}
             record = {
-                "date": data.get("calendarDate"),
-                "sleep_time_seconds": data.get("dailySleepDTO", {}).get("sleepTimeSeconds"),
-                "deep_sleep_seconds": data.get("dailySleepDTO", {}).get("deepSleepSeconds"),
-                "light_sleep_seconds": data.get("dailySleepDTO", {}).get("lightSleepSeconds"),
-                "rem_sleep_seconds": data.get("dailySleepDTO", {}).get("remSleepSeconds"),
-                "awake_sleep_seconds": data.get("dailySleepDTO", {}).get("awakeSleepSeconds"),
-                "sleep_score": data.get("dailySleepDTO", {}).get("sleepScore", {}).get("value"),
+                "date": dto.get("calendarDate"),
+                "sleep_time_seconds": dto.get("sleepTimeSeconds"),
+                "deep_sleep_seconds": dto.get("deepSleepSeconds"),
+                "light_sleep_seconds": dto.get("lightSleepSeconds"),
+                "rem_sleep_seconds": dto.get("remSleepSeconds"),
+                "awake_sleep_seconds": dto.get("awakeSleepSeconds"),
+                "sleep_score": (dto.get("sleepScore") or {}).get("value"),
             }
             records.append(record)
 
@@ -134,8 +135,10 @@ def process_fit_files():
         if not records:
             continue
 
-        # 4. Convert to DataFrame and save as Parquet
+        # 4. Convert to DataFrame, drop undocumented proprietary Garmin fields
         df = pd.DataFrame(records)
+        unknown_cols = [c for c in df.columns if c.startswith("unknown_")]
+        df = df.drop(columns=unknown_cols)
         output_path = PROCESSED_DIR / f"silver_run_{activity_id}.parquet"
         df.to_parquet(output_path, index=False)
         logger.info(f"Run telemetry saved with {len(df)} rows to {output_path}")
