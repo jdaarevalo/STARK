@@ -3,3 +3,4 @@
 uv.lock
 data/raw/*
 **/__pycache__/*
+**/*.parquet

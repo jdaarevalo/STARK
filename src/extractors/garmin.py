@@ -119,14 +119,17 @@ if __name__ == "__main__":
     from src.config.logging_config import setup_logging
     setup_logging()
 
-    # 1. Authenticate
+    # Authenticate
     client = init_garmin_client()
 
-    # 2. Extract today's sleep data
+    # Extract today's sleep data
     today = date.today()
     extract_sleep_data(client, today)
 
-    # 3. Extract the latest run
+    # Extract health summary
+    extract_daily_health_summary(client, today)
+
+    # Extract the latest run
     extract_latest_run_fit(client)
 
     logger.info("Extraction pipeline finished.")
