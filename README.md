@@ -20,27 +20,111 @@ This project implements a localized Medallion Architecture (Bronze -> Silver -> 
 ## 🛠 Tech Stack
 
 * **Language:** Python 3.11+
-* **Data Extraction:** `garminconnect`, `fitparse`
+* **Package Manager:** `uv`
+* **Data Extraction:** `garminconnect`, `fitparse`, `pyarrow`
 * **Local Data Warehouse:** `DuckDB` (OLAP)
-* **Data Validation & Agent Tooling:** `Pydantic`, `pydantic-settings`
+* **Data Validation & Agent Tooling:** `Pydantic`, `pydantic-ai`
+* **Agent UI:** `Chainlit`
+* **LLM Backend:** `OpenAI`
+* **Visualization:** `Pandas`, `Plotly`
 * **Environment Management:** `python-dotenv`
+* **Testing:** `Pytest`
 
 ## 📂 Repository Structure
 
 ```text
 S.T.A.R.K./
-├── data/                       # Local Data Lakehouse
-│   ├── raw/                    # Bronze: Raw Garmin JSONs & .FIT files
-│   ├── processed/              # Silver: Cleansed Parquet files
-│   └── duckdb/                 # Gold: runner_data.db
+├── data/                           # Local Data Lakehouse (git-ignored)
+│   ├── raw/                        # Bronze: Raw Garmin JSONs & .FIT ZIPs
+│   ├── processed/                  # Silver: Cleansed Parquet files
+│   └── duckdb/                     # Gold: runner_data.db (DuckDB)
 ├── src/
-│   ├── config/                 # Pydantic BaseSettings & Agent Prompts
-│   ├── extractors/             # API clients (Garmin, Manual Inputs)
-│   ├── db/                     # DuckDB connection & SQL transformations
-│   ├── models/                 # Pydantic schemas (Data Contracts)
-│   └── agents/                 # Multi-agent logic (J.A.R.V.I.S. & Sub-agents)
-├── notebooks/                  # Jupyter notebooks for EDA on .FIT telemetry
-├── tests/                      # Pytest suite
-├── .env.example                # Template for secrets
-├── requirements.txt
-└── main.py                     # System entry point
+│   ├── config/
+│   │   └── logging_config.py       # Centralized logging setup (call once from main.py)
+│   ├── extractors/
+│   │   └── garmin.py               # Garmin API client: sleep, health telemetry, .FIT runs
+│   ├── db/
+│   │   ├── transformations.py      # Bronze → Silver: JSON/FIT → Parquet
+│   │   └── connection.py           # Silver → Gold: DuckDB views & query interface
+│   ├── models/                     # Pydantic schemas (Data Contracts) — WIP
+│   └── agents/                     # Multi-agent logic (J.A.R.V.I.S.) — WIP
+├── tests/
+│   ├── test_extractors.py
+│   ├── test_transformations.py
+│   └── test_connection.py
+├── .env.example                    # Template for secrets
+├── pyproject.toml
+└── main.py                         # System entry point
+```
+
+## 🚀 Setup
+
+**Prerequisites:** Python 3.11+, [`uv`](https://github.com/astral-sh/uv)
+
+```bash
+# Clone and install dependencies
+git clone <repo-url>
+cd STARK
+uv sync
+
+# Configure credentials
+cp .env.example .env
+# Edit .env with your Garmin email and password
+```
+
+`.env` required variables:
+```
+GARMIN_EMAIL=your@email.com
+GARMIN_PASSWORD=yourpassword
+```
+
+## ⚙️ Running the Pipeline
+
+Each step can be run independently:
+
+```bash
+# 1. Extract raw data from Garmin (Bronze layer)
+uv run python src/extractors/garmin.py
+
+# 2. Transform raw data into Parquet (Bronze → Silver)
+uv run python src/db/transformations.py
+
+# 3. Query the Gold layer via DuckDB
+uv run python src/db/connection.py
+```
+
+## 📊 Data Extracted
+
+### Bronze layer (`data/raw/`)
+
+| File pattern | Source | Description |
+|---|---|---|
+| `sleep_data_YYYY-MM-DD.json` | Garmin API | Raw sleep session data |
+| `health_telemetry_YYYY-MM-DD.json` | Garmin API | HRV, body battery, stress, VO2 Max, steps |
+| `run_YYYY-MM-DD_<id>.zip` | Garmin API | Original `.FIT` binary file (second-by-second telemetry) |
+
+### Silver layer (`data/processed/`)
+
+| File | Columns |
+|---|---|
+| `silver_sleep_data.parquet` | `date`, `sleep_time_seconds`, `deep/light/rem/awake_sleep_seconds`, `sleep_score`, `sleep_score_qualifier`, `avg_heart_rate`, `avg_respiration`, `avg_spo2`, `avg_stress`, `sleep_score_feedback` |
+| `silver_health_telemetry.parquet` | `date`, `resting_heart_rate`, `avg_stress_level`, `steps`, `active_calories`, `total_distance_meters`, `hrv_weekly_avg`, `hrv_last_night_avg`, `hrv_status`, `body_battery_end`, `training_status_phrase`, `vo2_max` |
+| `silver_run_<id>.parquet` | `timestamp`, `distance`, `heart_rate`, `cadence`, `power`, `enhanced_speed`, `enhanced_altitude`, `position_lat`, `position_long`, `temperature`, `vertical_oscillation`, `vertical_ratio`, `stance_time`, `step_length`, ... |
+
+### Gold layer (`data/duckdb/runner_data.db`)
+
+DuckDB views defined in `src/db/connection.py`:
+
+| View | Description |
+|---|---|
+| `gold_sleep` | Wraps `silver_sleep_data.parquet` |
+| `gold_health` | Wraps `silver_health_telemetry.parquet` |
+| `gold_runs` | Union of all `silver_run_*.parquet` files with `union_by_name=true` |
+
+## 🧪 Tests
+
+```bash
+uv run pytest tests/ -v
+```
+
+13 tests covering extractors (Garmin API mocking), transformations (JSON → Parquet), and the DuckDB connection layer.
