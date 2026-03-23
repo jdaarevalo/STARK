@@ -33,6 +33,7 @@ def process_sleep_jsons():
             data = json.load(f)
             # Extract high-level metrics for J.A.R.V.I.S.
             dto = data.get("dailySleepDTO") or {}
+            scores = dto.get("sleepScores") or {}
             record = {
                 "date": dto.get("calendarDate"),
                 "sleep_time_seconds": dto.get("sleepTimeSeconds"),
@@ -40,7 +41,13 @@ def process_sleep_jsons():
                 "light_sleep_seconds": dto.get("lightSleepSeconds"),
                 "rem_sleep_seconds": dto.get("remSleepSeconds"),
                 "awake_sleep_seconds": dto.get("awakeSleepSeconds"),
-                "sleep_score": (dto.get("sleepScore") or {}).get("value"),
+                "sleep_score": (scores.get("overall") or {}).get("value"),
+                "sleep_score_qualifier": (scores.get("overall") or {}).get("qualifierKey"),
+                "avg_heart_rate": dto.get("avgHeartRate"),
+                "avg_respiration": dto.get("averageRespirationValue"),
+                "avg_spo2": dto.get("averageSpO2Value"),
+                "avg_stress": dto.get("avgSleepStress"),
+                "sleep_score_feedback": dto.get("sleepScoreFeedback"),
             }
             records.append(record)
 
@@ -82,13 +89,15 @@ def process_health_telemetry_jsons():
             "total_distance_meters": summary.get("totalDistanceMeters"),
             # HRV
             "hrv_weekly_avg": hrv_summary.get("weeklyAvg"),
-            "hrv_last_night_avg": hrv_summary.get("lastNight"),
+            "hrv_last_night_avg": hrv_summary.get("lastNightAvg"),
             "hrv_status": hrv_summary.get("status"),
-            # Body battery — take the last reading of the day
-            "body_battery_end": body_battery[-1].get("value") if body_battery else None,
+            # Body battery — last value in bodyBatteryValuesArray is [timestamp, level]
+            "body_battery_end": (body_battery[0]["bodyBatteryValuesArray"][-1][1]
+                                 if body_battery and body_battery[0].get("bodyBatteryValuesArray")
+                                 else None),
             # Training status
             "training_status_phrase": training_status.get("trainingStatusPhrase"),
-            "vo2_max": training_status.get("mostRecentVO2Max"),
+            "vo2_max": (training_status.get("mostRecentVO2Max") or {}).get("generic", {}).get("vo2MaxPreciseValue"),
         }
         records.append(record)
 
