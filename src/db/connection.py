@@ -85,6 +85,46 @@ class StarkDatabase:
             logger.error(f"Failed to retrieve run telemetry for {activity_id}: {e}")
             return None
 
+    def get_recent_runs(self, limit: int = 4) -> list:
+        """Returns detailed telemetry for the most recent runs, ordered by date descending."""
+        query = """
+            SELECT
+                source_file,
+                MIN(timestamp)                                  AS run_date,
+                epoch_ms(MAX(timestamp) - MIN(timestamp)) / 60000.0 AS duration_minutes,
+                MAX(distance)                                   AS total_distance_meters,
+                MAX(accumulated_power)                          AS total_accumulated_power_w,
+                AVG(power)                                      AS avg_power_w,
+                MAX(power)                                      AS max_power_w,
+                AVG(heart_rate)                                 AS avg_heart_rate,
+                MAX(heart_rate)                                 AS max_heart_rate,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE heart_rate < 125)              / COUNT(*), 1) AS pct_z1,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE heart_rate BETWEEN 125 AND 144) / COUNT(*), 1) AS pct_z2,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE heart_rate BETWEEN 145 AND 159) / COUNT(*), 1) AS pct_z3,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE heart_rate BETWEEN 160 AND 174) / COUNT(*), 1) AS pct_z4,
+                ROUND(100.0 * COUNT(*) FILTER (WHERE heart_rate >= 175)              / COUNT(*), 1) AS pct_z5,
+                AVG(enhanced_speed)                             AS avg_speed_m_s,
+                AVG(cadence) * 2                                AS avg_cadence_spm,
+                AVG(step_length)                                AS avg_step_length_mm,
+                AVG(vertical_oscillation)                       AS avg_vertical_oscillation_mm,
+                AVG(vertical_ratio)                             AS avg_vertical_ratio_pct,
+                AVG(stance_time)                                AS avg_stance_time_ms,
+                AVG(temperature)                                AS avg_temperature_c,
+                AVG(enhanced_altitude)                          AS avg_altitude_m
+            FROM gold_runs
+            GROUP BY source_file
+            ORDER BY run_date DESC
+            LIMIT ?
+        """
+        try:
+            result = self.conn.execute(query, [limit]).df()
+            if result.empty:
+                return []
+            return result.to_dict(orient="records")
+        except Exception as e:
+            logger.error(f"Failed to retrieve recent runs: {e}")
+            return []
+
     def get_daily_readiness(self, target_date: str) -> Optional[Dict[str, Any]]:
         """Returns sleep and recovery metrics for a specific date."""
         query = """

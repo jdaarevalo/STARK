@@ -25,7 +25,7 @@ This project implements a localized Medallion Architecture (Bronze -> Silver -> 
 * **Local Data Warehouse:** `DuckDB` (OLAP)
 * **Data Validation & Agent Tooling:** `Pydantic`, `pydantic-ai`
 * **Agent UI:** `Chainlit`
-* **LLM Backend:** `OpenAI`
+* **LLM Backend:** `Gemini` (`gemini-3.1-pro-preview` via `pydantic-ai`)
 * **Visualization:** `Pandas`, `Plotly`
 * **Environment Management:** `python-dotenv`
 * **Testing:** `Pytest`

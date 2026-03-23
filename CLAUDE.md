@@ -48,12 +48,17 @@ from src.config.logging_config import setup_logging
 setup_logging()
 ```
 
-For standalone script execution, add this to the `if __name__ == "__main__"` block:
+For standalone script execution, add `sys.path.insert` at **module level** (before any `src.*` import), and `setup_logging()` inside `__main__`:
 ```python
 import sys
-sys.path.insert(0, str(PROJECT_ROOT))
-from src.config.logging_config import setup_logging
-setup_logging()
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[N]))  # must be before src imports
+
+from src.models.whatever import Something  # now resolves correctly
+
+if __name__ == "__main__":
+    from src.config.logging_config import setup_logging
+    setup_logging()
 ```
 
 Log format: `2026-03-21 10:00:00 | INFO     | src.extractors.garmin | message`
