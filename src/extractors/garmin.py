@@ -1,10 +1,10 @@
 import os
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
-from garminconnect import Garmin, GarminConnectConnectionError, GarminConnectAuthenticationError
+from garminconnect import Garmin
 
 # Project root (two levels up from this file: src/extractors/ -> src/ -> root)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -19,23 +19,32 @@ def init_garmin_client():
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
 
-    # Directory where OAuth session tokens are stored
+    # Directory where OAuth session tokens are stored (garth format)
     tokenstore = os.path.expanduser("~/.garminconnect")
 
-    try:
-        logger.info("Attempting to load saved session...")
-        client = Garmin(email, password, session_data=tokenstore)
-        client.login()
-        logger.info("Login successful using saved tokens!")
-    except (GarminConnectAuthenticationError, Exception) as e:
-        logger.warning("Could not use saved session. Starting fresh login...")
-        # Falls back to full login (e.g. first run or expired tokens)
-        client = Garmin(email, password)
-        client.login()
-        # Persist the session for next run — garminconnect uses garth under the hood
-        import garth
-        garth.client.dump(tokenstore)
-        logger.info(f"Fresh login successful. Tokens saved to {tokenstore}")
+    client = Garmin(email, password)
+    tokenstore_path = Path(tokenstore)
+
+    # Only attempt token-based login if token files exist and are non-empty
+    has_tokens = (
+        tokenstore_path.is_dir()
+        and any(f.stat().st_size > 0 for f in tokenstore_path.glob("*.json"))
+    )
+
+    if has_tokens:
+        try:
+            logger.info("Attempting to load saved session...")
+            client.login(tokenstore=tokenstore)
+            logger.info("Login successful using saved tokens!")
+            return client
+        except Exception as e:
+            logger.warning(f"Saved session invalid ({e}). Falling back to fresh login...")
+
+    logger.info("Starting fresh login...")
+    client.login()
+    tokenstore_path.mkdir(parents=True, exist_ok=True)
+    client.garth.dump(tokenstore)
+    logger.info(f"Fresh login successful. Tokens saved to {tokenstore}")
 
     return client
 
@@ -78,39 +87,56 @@ def extract_daily_health_summary(client, target_date):
     logger.info(f"Health telemetry saved to {filename}")
 
 
-def extract_latest_run_fit(client):
-    """Fetches the latest run and downloads its original .FIT file."""
-    logger.info("Looking for the latest activity...")
-    try:
-        # Fetch the last 5 activities to find the latest run
-        activities = client.get_activities(0, 5)
+def get_last_extracted_date() -> date:
+    """
+    Returns the most recent date for which sleep data was already extracted.
+    Falls back to yesterday if no files exist yet.
+    """
+    existing = sorted(RAW_DATA_DIR.glob("sleep_data_*.json"))
+    if not existing:
+        return date.today() - timedelta(days=1)
+    latest_filename = existing[-1].stem  # e.g. "sleep_data_2026-03-23"
+    date_str = latest_filename.replace("sleep_data_", "")
+    return date.fromisoformat(date_str)
 
-        # Filter only running activities
-        runs = [act for act in activities if act.get('activityType', {}).get('typeKey') == 'running']
+
+def extract_runs_in_range(client, start_date: date, end_date: date) -> None:
+    """
+    Downloads .FIT files for all runs between start_date and end_date (inclusive).
+    Skips activities already present in data/raw/.
+    """
+    logger.info(f"Scanning runs from {start_date} to {end_date}...")
+    try:
+        # Fetch enough activities to cover the date range (50 is a safe ceiling)
+        activities = client.get_activities(0, 50)
+        runs = [
+            act for act in activities
+            if act.get("activityType", {}).get("typeKey") == "running"
+            and start_date <= date.fromisoformat(act["startTimeLocal"][:10]) <= end_date
+        ]
 
         if not runs:
-            logger.warning("No recent runs found.")
+            logger.info("No runs found in the specified date range.")
             return
 
-        latest_run = runs[0]
-        activity_id = latest_run['activityId']
-        activity_name = latest_run.get('activityName', 'Run')
-        start_time = latest_run['startTimeLocal'][:10]  # YYYY-MM-DD
-
-        logger.info(f"Latest run found: '{activity_name}' on {start_time} (ID: {activity_id})")
-
-        # Download the original FIT file
-        logger.info(f"Downloading .FIT file for activity {activity_id}...")
-        fit_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.ORIGINAL)
-
         RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        filename = RAW_DATA_DIR / f"run_{start_time}_{activity_id}.zip"  # Garmin returns a ZIP containing the FIT
-        with open(filename, "wb") as f:
-            f.write(fit_data)
-        logger.info(f"Raw file saved as {filename}")
+        for run in runs:
+            activity_id = run["activityId"]
+            start_time = run["startTimeLocal"][:10]
+            filename = RAW_DATA_DIR / f"run_{start_time}_{activity_id}.zip"
+
+            if filename.exists():
+                logger.info(f"Skipping run {activity_id} on {start_time} — already downloaded.")
+                continue
+
+            logger.info(f"Downloading .FIT for '{run.get('activityName', 'Run')}' on {start_time} (ID: {activity_id})...")
+            fit_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.ORIGINAL)
+            with open(filename, "wb") as f:
+                f.write(fit_data)
+            logger.info(f"Saved {filename}")
 
     except Exception as e:
-        logger.error(f"Error extracting activity: {e}")
+        logger.error(f"Error extracting runs in range: {e}")
 
 
 if __name__ == "__main__":
@@ -119,17 +145,30 @@ if __name__ == "__main__":
     from src.config.logging_config import setup_logging
     setup_logging()
 
-    # Authenticate
     client = init_garmin_client()
 
-    # Extract today's sleep data
     today = date.today()
-    extract_sleep_data(client, today)
+    last_extracted = get_last_extracted_date()
+    logger.info(f"Extracting data from {last_extracted} to {today} (inclusive)...")
 
-    # Extract health summary
-    extract_daily_health_summary(client, today)
+    # Extract sleep + health for each missing day
+    current = last_extracted
+    while current <= today:
+        sleep_file = RAW_DATA_DIR / f"sleep_data_{current}.json"
+        if not sleep_file.exists():
+            extract_sleep_data(client, current)
+        else:
+            logger.info(f"Skipping sleep data for {current} — already extracted.")
 
-    # Extract the latest run
-    extract_latest_run_fit(client)
+        health_file = RAW_DATA_DIR / f"health_telemetry_{current}.json"
+        if not health_file.exists():
+            extract_daily_health_summary(client, current)
+        else:
+            logger.info(f"Skipping health telemetry for {current} — already extracted.")
+
+        current += timedelta(days=1)
+
+    # Extract all runs in the same range
+    extract_runs_in_range(client, last_extracted, today)
 
     logger.info("Extraction pipeline finished.")

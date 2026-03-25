@@ -47,7 +47,7 @@ def build_agent() -> Agent:
     return Agent(
         model=model,
         system_prompt=JARVIS_SYSTEM_PROMPT,
-        #output_type=DailyActionPlan,
+        output_type=DailyActionPlan,
     )
 
 
@@ -129,8 +129,10 @@ def get_athlete_context(ctx: RunContext[str]) -> dict:
         "age": 42,
         "weight_kg": 87.7,
         "current_shoes": "New Balance (47 km on them)",
-        "primary_goal": "Sub 1:59 Half Marathon",
-        "target_race_date": "2026-05-15",
+        "final_goal": "Sub 1:59 Half Marathon",
+        "next_goal": "2:10 Half Marathon",
+        "target_race_date": "2026-05-17",
+        "race_name": "Regensburg Marathon (HalbMarathon)",
     }
 
 
