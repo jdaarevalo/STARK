@@ -5,3 +5,4 @@ data/raw/*
 data/duckdb/*
 **/__pycache__/*
 **/*.parquet
+local_storage.txt

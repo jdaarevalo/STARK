@@ -13,38 +13,38 @@ RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
 logger = logging.getLogger(__name__ if __name__ != "__main__" else "src.extractors.garmin")
 
 
-def init_garmin_client():
-    """Initializes the Garmin client and manages the session to avoid lockouts."""
+def init_garmin_client() -> Garmin:
+    """Returns an authenticated Garmin client using saved DI tokens.
+
+    Tokens must exist at ~/.garminconnect — run `uv run python scripts/garmin_auth.py` first.
+    """
     load_dotenv()
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
 
-    # Directory where OAuth session tokens are stored (garth format)
     tokenstore = os.path.expanduser("~/.garminconnect")
-
-    client = Garmin(email, password)
     tokenstore_path = Path(tokenstore)
 
-    # Only attempt token-based login if token files exist and are non-empty
     has_tokens = (
         tokenstore_path.is_dir()
         and any(f.stat().st_size > 0 for f in tokenstore_path.glob("*.json"))
     )
 
-    if has_tokens:
-        try:
-            logger.info("Attempting to load saved session...")
-            client.login(tokenstore=tokenstore)
-            logger.info("Login successful using saved tokens!")
-            return client
-        except Exception as e:
-            logger.warning(f"Saved session invalid ({e}). Falling back to fresh login...")
+    if not has_tokens:
+        raise RuntimeError(
+            "No Garmin tokens found. Run `uv run python scripts/garmin_auth.py` first."
+        )
 
-    logger.info("Starting fresh login...")
-    client.login()
-    tokenstore_path.mkdir(parents=True, exist_ok=True)
-    client.garth.dump(tokenstore)
-    logger.info(f"Fresh login successful. Tokens saved to {tokenstore}")
+    client = Garmin(email, password)
+    try:
+        logger.info("Loading saved Garmin tokens...")
+        client.login(tokenstore=tokenstore)
+        logger.info("Authenticated successfully.")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to authenticate with saved tokens ({e}). "
+            "Re-run `uv run python scripts/garmin_auth.py` to refresh them."
+        ) from e
 
     return client
 

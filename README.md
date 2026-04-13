@@ -38,6 +38,8 @@ S.T.A.R.K./
 │   ├── raw/                        # Bronze: Raw Garmin JSONs & .FIT ZIPs
 │   ├── processed/                  # Silver: Cleansed Parquet files
 │   └── duckdb/                     # Gold: runner_data.db (DuckDB)
+├── scripts/
+│   └── garmin_auth.py              # One-time Playwright auth — run before the extractor
 ├── src/
 │   ├── config/
 │   │   └── logging_config.py       # Centralized logging setup (call once from main.py)
@@ -46,12 +48,16 @@ S.T.A.R.K./
 │   ├── db/
 │   │   ├── transformations.py      # Bronze → Silver: JSON/FIT → Parquet
 │   │   └── connection.py           # Silver → Gold: DuckDB views & query interface
-│   ├── models/                     # Pydantic schemas (Data Contracts) — WIP
-│   └── agents/                     # Multi-agent logic (J.A.R.V.I.S.) — WIP
+│   ├── models/
+│   │   ├── biometrics.py           # DailyReadiness, RunSummary, AthleteContext
+│   │   └── workouts.py             # Workout plan models — WIP
+│   └── agents/
+│       └── planner_agent.py        # J.A.R.V.I.S. planner agent — WIP
 ├── tests/
 │   ├── test_extractors.py
 │   ├── test_transformations.py
-│   └── test_connection.py
+│   ├── test_connection.py
+│   └── test_biometrics.py
 ├── .env.example                    # Template for secrets
 ├── pyproject.toml
 └── main.py                         # System entry point
@@ -67,6 +73,9 @@ git clone <repo-url>
 cd STARK
 uv sync
 
+# Install Playwright's Chromium browser (required for auth)
+uv run playwright install chromium
+
 # Configure credentials
 cp .env.example .env
 # Edit .env with your Garmin email and password
@@ -79,6 +88,18 @@ GARMIN_PASSWORD=yourpassword
 ```
 
 ## ⚙️ Running the Pipeline
+
+### First-time authentication
+
+Garmin's SSO blocks headless/automated login attempts. Run this **once** to authenticate via a real browser and save the session tokens locally:
+
+```bash
+uv run python scripts/garmin_auth.py
+```
+
+A Chromium window will open — log in manually. Tokens are saved to `~/.garminconnect/` and reused automatically on every subsequent run.
+
+### Data pipeline
 
 Each step can be run independently:
 
@@ -127,4 +148,4 @@ DuckDB views defined in `src/db/connection.py`:
 uv run pytest tests/ -v
 ```
 
-13 tests covering extractors (Garmin API mocking), transformations (JSON → Parquet), and the DuckDB connection layer.
+27 tests covering extractors (Garmin API mocking), transformations (JSON → Parquet), DuckDB connection layer, and Pydantic biometric models.
