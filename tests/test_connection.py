@@ -1,9 +1,6 @@
-import json
 import pytest
 import pandas as pd
-from pathlib import Path
 from unittest.mock import patch
-from datetime import date
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -22,8 +19,6 @@ def db_with_data(tmp_path):
     """Creates a StarkDatabase backed by real Parquet fixtures in tmp_path."""
     processed = tmp_path / "processed"
     processed.mkdir()
-    db_path = tmp_path / "test.db"
-
     # Sleep fixture
     sleep_df = pd.DataFrame([{
         "date": pd.Timestamp("2026-03-21"),
@@ -69,10 +64,9 @@ def db_with_data(tmp_path):
     }])
     run_df.to_parquet(processed / "silver_run_12345.parquet", index=False)
 
-    with patch("src.db.connection.DB_PATH", db_path), \
-         patch("src.db.connection.PROCESSED_DIR", processed):
+    with patch("src.db.connection.PROCESSED_DIR", processed):
         from src.db.connection import StarkDatabase
-        db = StarkDatabase(db_path=db_path)
+        db = StarkDatabase()
         yield db
         db.close()
 

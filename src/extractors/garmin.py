@@ -87,6 +87,21 @@ def extract_daily_health_summary(client, target_date):
     logger.info(f"Health telemetry saved to {filename}")
 
 
+def extract_hydration(client, target_date) -> None:
+    """Extracts daily hydration intake from Garmin Connect."""
+    date_str = target_date.isoformat()
+    logger.info(f"Extracting hydration data for {date_str}...")
+    try:
+        data = client.get_hydration_data(date_str)
+        RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        filename = RAW_DATA_DIR / f"hydration_{date_str}.json"
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=4)
+        logger.info(f"Hydration data saved to {filename}")
+    except Exception as e:
+        logger.error(f"Error extracting hydration data for {date_str}: {e}")
+
+
 def get_last_extracted_date() -> date:
     """
     Returns the most recent date for which sleep data was already extracted.
@@ -139,19 +154,19 @@ def extract_runs_in_range(client, start_date: date, end_date: date) -> None:
         logger.error(f"Error extracting runs in range: {e}")
 
 
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, str(PROJECT_ROOT))
-    from src.config.logging_config import setup_logging
-    setup_logging()
+def run_full_extraction() -> None:
+    """
+    Full extraction pipeline: authenticates with Garmin and downloads all missing
+    sleep, health telemetry, and .FIT run files up to today.
 
+    Raises RuntimeError if authentication fails (no tokens or expired tokens).
+    """
     client = init_garmin_client()
 
     today = date.today()
     last_extracted = get_last_extracted_date()
     logger.info(f"Extracting data from {last_extracted} to {today} (inclusive)...")
 
-    # Extract sleep + health for each missing day
     current = last_extracted
     while current <= today:
         sleep_file = RAW_DATA_DIR / f"sleep_data_{current}.json"
@@ -166,9 +181,21 @@ if __name__ == "__main__":
         else:
             logger.info(f"Skipping health telemetry for {current} — already extracted.")
 
+        hydration_file = RAW_DATA_DIR / f"hydration_{current}.json"
+        if not hydration_file.exists():
+            extract_hydration(client, current)
+        else:
+            logger.info(f"Skipping hydration for {current} — already extracted.")
+
         current += timedelta(days=1)
 
-    # Extract all runs in the same range
     extract_runs_in_range(client, last_extracted, today)
-
     logger.info("Extraction pipeline finished.")
+
+
+if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, str(PROJECT_ROOT))
+    from src.config.logging_config import setup_logging
+    setup_logging()
+    run_full_extraction()

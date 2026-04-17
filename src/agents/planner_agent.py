@@ -1,5 +1,4 @@
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -7,13 +6,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import uvicorn
-from dotenv import load_dotenv
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.google import GoogleModel
-from pydantic_ai.providers.google import GoogleProvider
 from starlette.applications import Starlette
 
+from src.config.agents import get_google_model
 from src.db.connection import StarkDatabase
+from src.models.biometrics import format_pace
 from src.models.workouts import DailyActionPlan
 
 logger = logging.getLogger(__name__ if __name__ != "__main__" else "src.agents.planner_agent")
@@ -39,13 +37,10 @@ Your output MUST be exclusively valid JSON strictly matching the provided schema
 
 
 def build_agent() -> Agent:
-    """Initializes the J.A.R.V.I.S. planner agent. Call once from main.py after load_dotenv()."""
-    load_dotenv()
-    api_key = os.getenv("GOOGLE_API_KEY")
-    model = GoogleModel("gemini-3.1-pro-preview", provider=GoogleProvider(api_key=api_key))
+    """Initializes the J.A.R.V.I.S. planner agent."""
     logger.info("J.A.R.V.I.S. planner agent initialized.")
     return Agent(
-        model=model,
+        model=get_google_model(),
         system_prompt=JARVIS_SYSTEM_PROMPT,
         output_type=DailyActionPlan,
     )
@@ -86,12 +81,7 @@ def get_recent_runs(ctx: RunContext[str], limit: int = 4) -> list:
     runs = []
     for row in rows:
         activity_id = str(row["source_file"]).split("silver_run_")[-1].replace(".parquet", "")
-        speed = row.get("avg_speed_m_s") or 0
-        if speed > 0:
-            pace_s = 1000 / speed
-            pace = f"{int(pace_s // 60)}:{int(pace_s % 60):02d} min/km"
-        else:
-            pace = "N/A"
+        pace = format_pace(row.get("avg_speed_m_s") or 0)
         runs.append({
             "activity_id": activity_id,
             "run_date": str(row["run_date"])[:10],

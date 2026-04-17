@@ -109,6 +109,42 @@ def process_health_telemetry_jsons():
     logger.info(f"Saved {len(df)} health telemetry records to {output_path}")
 
 
+def process_hydration_jsons():
+    """Reads hydration JSONs and saves them as a single consolidated Parquet file."""
+    logger.info("Starting hydration JSON processing...")
+    json_files = glob.glob(str(RAW_DIR / "hydration_*.json"))
+
+    if not json_files:
+        logger.warning("No hydration files found in raw.")
+        return
+
+    records = []
+    for file in json_files:
+        with open(file, "r") as f:
+            data = json.load(f)
+        if not data or not data.get("calendarDate"):
+            continue
+        records.append({
+            "date": data.get("calendarDate"),
+            "intake_ml": data.get("valueInML"),
+            "goal_ml": data.get("goalInML"),
+            "sweat_loss_ml": data.get("sweatLossInML"),
+            "activity_intake_ml": data.get("activityIntakeInML"),
+            "last_entry_local": data.get("lastEntryTimestampLocal"),
+        })
+
+    if not records:
+        logger.warning("No valid hydration records to process.")
+        return
+
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"])
+
+    output_path = PROCESSED_DIR / "silver_hydration.parquet"
+    df.to_parquet(output_path, index=False)
+    logger.info(f"Saved {len(df)} hydration records to {output_path}")
+
+
 def process_fit_files():
     """Unzips run ZIPs, parses the .FIT file and saves lap telemetry as Parquet."""
     logger.info("Starting run telemetry processing (.FIT)...")
@@ -121,6 +157,11 @@ def process_fit_files():
     for zip_path in zip_files:
         filename = os.path.basename(zip_path)
         activity_id = filename.split("_")[-1].replace(".zip", "")
+
+        output_path = PROCESSED_DIR / f"silver_run_{activity_id}.parquet"
+        if output_path.exists():
+            logger.info(f"Skipping run {activity_id} — already processed.")
+            continue
 
         # 1. Temporarily extract the FIT file from the ZIP
         with zipfile.ZipFile(zip_path, "r") as z:
@@ -148,7 +189,6 @@ def process_fit_files():
         df = pd.DataFrame(records)
         unknown_cols = [c for c in df.columns if c.startswith("unknown_")]
         df = df.drop(columns=unknown_cols)
-        output_path = PROCESSED_DIR / f"silver_run_{activity_id}.parquet"
         df.to_parquet(output_path, index=False)
         logger.info(f"Run telemetry saved with {len(df)} rows to {output_path}")
 
@@ -161,5 +201,6 @@ if __name__ == "__main__":
 
     process_sleep_jsons()
     process_health_telemetry_jsons()
+    process_hydration_jsons()
     process_fit_files()
     logger.info("Bronze -> Silver processing complete.")

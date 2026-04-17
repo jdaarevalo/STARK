@@ -44,10 +44,10 @@ def test_extract_sleep_data_handles_api_error(tmp_path, caplog):
     assert not any(tmp_path.iterdir())
 
 
-# ── extract_latest_run_fit ────────────────────────────────────────────────────
+# ── extract_runs_in_range ─────────────────────────────────────────────────────
 
-def test_extract_latest_run_fit_writes_zip(tmp_path):
-    from src.extractors.garmin import extract_latest_run_fit
+def test_extract_runs_in_range_writes_zip(tmp_path):
+    from src.extractors.garmin import extract_runs_in_range
 
     activities = [{
         "activityType": {"typeKey": "running"},
@@ -58,22 +58,22 @@ def test_extract_latest_run_fit_writes_zip(tmp_path):
     client = make_garmin_client(activities=activities, fit_bytes=b"FITDATA")
 
     with patch("src.extractors.garmin.RAW_DATA_DIR", tmp_path):
-        extract_latest_run_fit(client)
+        extract_runs_in_range(client, date(2026, 3, 21), date(2026, 3, 21))
 
     output = tmp_path / "run_2026-03-21_12345.zip"
     assert output.exists()
     assert output.read_bytes() == b"FITDATA"
 
 
-def test_extract_latest_run_fit_no_runs_logs_warning(tmp_path, caplog):
-    from src.extractors.garmin import extract_latest_run_fit
+def test_extract_runs_in_range_no_matching_runs(tmp_path):
+    from src.extractors.garmin import extract_runs_in_range
 
     client = make_garmin_client(activities=[
         {"activityType": {"typeKey": "cycling"}, "activityId": 99}
     ])
 
     with patch("src.extractors.garmin.RAW_DATA_DIR", tmp_path):
-        extract_latest_run_fit(client)
+        extract_runs_in_range(client, date(2026, 3, 21), date(2026, 3, 21))
 
     assert not any(tmp_path.iterdir())
 

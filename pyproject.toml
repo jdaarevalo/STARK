@@ -5,7 +5,8 @@ description = "AI-driven data engineering pipeline and multi-agent orchestration
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "chainlit>=2.9.6",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
     "duckdb>=1.4.4",
     "openai>=2.21.0",
     "pandas>=3.0.1",
@@ -18,6 +19,7 @@ dependencies = [
     "fitparse>=1.2.0",
     "pyarrow>=19.0.0",
     "playwright>=1.58.0",
+    "streamlit>=1.56.0",
 ]
 
 [tool.uv.workspace]

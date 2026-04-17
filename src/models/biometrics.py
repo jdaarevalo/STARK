@@ -4,6 +4,14 @@ from typing import Optional
 from pydantic import BaseModel, Field, computed_field
 
 
+def format_pace(speed_m_s: float) -> str:
+    """Converts speed in m/s to a 'M:SS min/km' string. Returns 'N/A' for zero/None."""
+    if not speed_m_s or speed_m_s <= 0:
+        return "N/A"
+    pace_s = 1000 / speed_m_s
+    return f"{int(pace_s // 60)}:{int(pace_s % 60):02d} min/km"
+
+
 class SubjectiveWellness(BaseModel):
     """
     Subjective inputs reported by the athlete each morning.
@@ -89,6 +97,13 @@ class RunSummary(BaseModel):
         )
 
 
+class ShoeEntry(BaseModel):
+    """Tracks mileage for a single pair of running shoes."""
+    name: str = Field(..., description="Shoe model name (e.g. 'Nike Vaporfly 3')")
+    start_date: datetime.date = Field(..., description="Date the shoe was first used")
+    max_km: int = Field(default=600, description="Recommended maximum mileage before replacement (km)")
+
+
 class AthleteContext(BaseModel):
     """Current athlete profile to provide context to the AI."""
     age: int
@@ -97,3 +112,60 @@ class AthleteContext(BaseModel):
     current_shoes: str = Field(..., description="Current shoes and approximate mileage on them")
     primary_goal: str = Field(default="Improve Half Marathon time")
     target_race_date: Optional[datetime.date] = Field(None, description="Target Half Marathon race date")
+    lthr: Optional[int] = Field(None, description="Lactate Threshold Heart Rate in bpm — used to calculate TSS")
+    target_pace_min_per_km: Optional[float] = Field(None, description="Target race pace in decimal min/km (e.g. 4.917 = 4:55)")
+    shoes: Optional[list[ShoeEntry]] = Field(None, description="List of active shoe entries for mileage tracking")
+
+
+# ── Biomechanics report models ─────────────────────────────────────────────────
+
+class MetricFocus(BaseModel):
+    """A single biomechanical metric the athlete should focus on improving."""
+    metric: str = Field(description="Metric name (e.g. 'Ground Contact Time')")
+    current_value: str = Field(description="Current measured average with units (e.g. '287 ms')")
+    target_value: str = Field(description="Optimal target range with units (e.g. '240-260 ms')")
+    why_it_matters: str = Field(description="One sentence on the biomechanical impact of this metric")
+    drill: str = Field(description="One specific drill or cue to improve this metric in the next session")
+
+
+class RunSnapshot(BaseModel):
+    """Per-run biomechanics summary for use inside a BiomechanicsReport."""
+    run_date: str = Field(description="Date of the run (YYYY-MM-DD)")
+    distance_km: float = Field(description="Total distance in km")
+    avg_pace: str = Field(description="Average pace in min/km (e.g. '6:59 min/km')")
+    avg_hr: float = Field(description="Average heart rate in bpm")
+    avg_cadence_spm: float = Field(description="Average cadence in steps per minute")
+    avg_vo_mm: float = Field(description="Average vertical oscillation in mm")
+    avg_vr_pct: float = Field(description="Average vertical ratio in %")
+    avg_gct_ms: float = Field(description="Average ground contact time in ms")
+    cardiac_drift_bpm: Optional[float] = Field(
+        None, description="HR increase from first to last third of the run (bpm). Positive = drift."
+    )
+    cadence_drift_spm: Optional[float] = Field(
+        None, description="Cadence change from first to last third (spm). Negative = fatigue shuffle."
+    )
+
+
+class BiomechanicsReport(BaseModel):
+    """
+    Structured output from the Biomechanics Analysis Agent.
+    Can be consumed by the Planner Agent as context for training prescription.
+    """
+    overall_assessment: str = Field(
+        description="2-3 sentence summary of overall running mechanics and efficiency trends across the analyzed runs"
+    )
+    runs: list[RunSnapshot] = Field(
+        description="One snapshot per analyzed run, ordered most recent first"
+    )
+    key_findings: list[str] = Field(
+        description="Top 3-4 specific biomechanical observations backed by numbers (e.g. 'Cadence drops 9 SPM on easy runs')"
+    )
+    strengths: list[str] = Field(
+        description="2-3 things the athlete is doing well biomechanically"
+    )
+    focus_metrics: list[MetricFocus] = Field(
+        description="Top 3 metrics to improve, ordered by impact on performance and injury prevention"
+    )
+    next_session_cues: list[str] = Field(
+        description="3-4 concrete mental cues to apply during the very next run (e.g. 'Think quick feet, aim for 170 SPM')"
+    )

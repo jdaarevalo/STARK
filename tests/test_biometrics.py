@@ -2,7 +2,7 @@ import datetime
 import pytest
 from pydantic import ValidationError
 
-from src.models.biometrics import AthleteContext, DailyReadiness, RunSummary, SubjectiveWellness
+from src.models.biometrics import AthleteContext, DailyReadiness, RunSummary, ShoeEntry, SubjectiveWellness
 
 
 # ── SubjectiveWellness ────────────────────────────────────────────────────────
@@ -135,3 +135,42 @@ def test_athlete_context_full():
     )
     assert a.vo2_max == 52.5
     assert a.target_race_date == datetime.date(2026, 10, 15)
+
+
+def test_athlete_context_new_fields_optional():
+    a = AthleteContext(age=28, weight_kg=70.0, current_shoes="Nike Vaporfly")
+    assert a.lthr is None
+    assert a.target_pace_min_per_km is None
+    assert a.shoes is None
+
+
+def test_athlete_context_with_lthr_and_pace():
+    a = AthleteContext(
+        age=28, weight_kg=70.0, current_shoes="Nike Vaporfly",
+        lthr=168, target_pace_min_per_km=4.917,
+    )
+    assert a.lthr == 168
+    assert a.target_pace_min_per_km == 4.917
+
+
+def test_athlete_context_with_shoes():
+    shoe = ShoeEntry(name="Vaporfly 3", start_date=datetime.date(2026, 1, 1), max_km=500)
+    a = AthleteContext(
+        age=28, weight_kg=70.0, current_shoes="Vaporfly 3",
+        shoes=[shoe],
+    )
+    assert len(a.shoes) == 1
+    assert a.shoes[0].name == "Vaporfly 3"
+    assert a.shoes[0].max_km == 500
+
+
+# ── ShoeEntry ─────────────────────────────────────────────────────────────────
+
+def test_shoe_entry_defaults():
+    s = ShoeEntry(name="Alphafly", start_date=datetime.date(2026, 3, 1))
+    assert s.max_km == 600
+
+
+def test_shoe_entry_custom_max_km():
+    s = ShoeEntry(name="Alphafly", start_date=datetime.date(2026, 3, 1), max_km=400)
+    assert s.max_km == 400
