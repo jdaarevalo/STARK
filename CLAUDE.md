@@ -15,16 +15,22 @@ scripts/
   garmin_auth.py             # One-time Playwright auth — run before the extractor
 src/
   config/logging_config.py   # Centralized logging — setup_logging() called once from main.py
+  config/agents.py           # GoogleModel factory — get_google_model()
   extractors/garmin.py       # Garmin API: sleep, health telemetry, .FIT runs
   db/transformations.py      # Bronze → Silver: JSON/FIT → Parquet
   db/connection.py           # Silver → Gold: DuckDB views + query interface (StarkDatabase)
+                             # Aggregation tools: get_readiness_snapshot, get_training_load_snapshot,
+                             # get_biomechanics_snapshot (pre-computed for the unified agent)
                              # Also exports: load/save_athlete_config, load/save_daily_input
   models/biometrics.py       # DailyReadiness, RunSummary, AthleteContext, ShoeEntry, BiomechanicsReport
   models/workouts.py         # DailyActionPlan, WorkoutInterval
-  agents/orchestrator.py     # J.A.R.V.I.S. master router — used by Streamlit + FastAPI
+  agents/jarvis_agent.py     # J.A.R.V.I.S. unified agent — PRIMARY entry point, 1 LLM call
+                             # Tools: get_readiness_snapshot, get_training_load_snapshot,
+                             #        get_biomechanics_snapshot, get_athlete_profile
+  agents/orchestrator.py     # Legacy orchestrator (3-LLM chain) — kept, not used by fastapi_app
   agents/planner_agent.py    # Training planner specialist — port 7932
-  chat/fastapi_app.py        # FastAPI SSE chat UI wrapping the orchestrator — port 7934
   agents/biomechanics_agent.py  # Biomechanics specialist — port 7933
+  chat/fastapi_app.py        # FastAPI SSE chat UI — port 7934, uses jarvis_agent
 data/
   raw/                       # Bronze: Garmin JSONs + .FIT ZIPs (git-ignored)
   processed/                 # Silver: Parquet files (git-ignored)
@@ -153,6 +159,15 @@ date: date
 
 ## Agents
 
+### Primary agent — `jarvis_agent.py`
+
+`src/agents/jarvis_agent.py` is the single active entry point used by `fastapi_app.py`.
+It is a unified agent (1 LLM call per user message) backed by aggregation tools in
+`connection.py`. **Do not add new sub-agent chains** — add aggregation methods to
+`StarkDatabase` and new `@agent.tool` functions in `jarvis_agent.py` instead.
+
+`orchestrator.py` is the legacy 3-LLM routing chain. It is kept but not used by the chat UI.
+
 ### Output models always live in `src/models/`
 
 Never define Pydantic output models inside an agent file. Agent files execute `build_agent()` at module level, which instantiates the LLM client and requires the API key. Any file that imports an agent module inherits that cost — even if it only needs a model class.
@@ -197,7 +212,7 @@ Each agent file follows this order:
 | Agent | Port | Notes |
 |---|---|---|
 | `streamlit run main.py` | 8501 | Dashboard + chat iframe |
-| `chat/fastapi_app.py` | 7934 | J.A.R.V.I.S. chat (embedded in Streamlit tab) |
+| `chat/fastapi_app.py` | 7934 | J.A.R.V.I.S. chat — uses `jarvis_agent` (unified, 1 LLM call) |
 | `planner_agent.py` | 7932 | Direct access / development |
 | `biomechanics_agent.py` | 7933 | Direct access / development |
 | Next specialist | 7935 | — |

@@ -81,8 +81,8 @@ _TOOLTIPS = {
     "run_efficiency": (
         "**Run Efficiency — Aerobic Adaptation Signal**\n\n"
         "Measures whether your 'Arc Reactor' is becoming more efficient over time. "
-        "Only uses runs classified as easy (Z1+Z2 ≥ 70% of HR records) to isolate "
-        "the aerobic signal from tempo/race efforts.\n\n"
+        "Only uses runs where average HR is below your Z3 threshold (easy effort), "
+        "isolating the aerobic signal from tempo/race efforts.\n\n"
         "- **Orange line (Pace)** — Average pace on easy runs, in min/km. "
         "Y-axis is **inverted**: faster pace appears higher on the chart.\n"
         "- **Purple line (HR)** — Average heart rate on those same runs.\n\n"
@@ -115,15 +115,6 @@ _TOOLTIPS = {
         "- **Yellow (FAIR)** — 50–69. Partial recovery; consider adjusting load.\n"
         "- **Red (POOR)** — <50. Prioritise sleep over training intensity.\n\n"
         "The dotted line marks the 70-point 'good' threshold."
-    ),
-    "running_trends": (
-        "**Running Trends — Session History**\n\n"
-        "- **Blue bars** — Distance per session in km.\n"
-        "- **Orange line** — Average pace per session in min/km "
-        "(Y-axis inverted: faster = higher).\n\n"
-        "Use this chart to spot volume spikes (a single bar much taller than "
-        "neighbours) or pace inconsistency. Sudden large increases in weekly "
-        "distance are the primary cause of overuse injuries."
     ),
     "hydration": (
         "**Hydration — 30-day Trend**\n\n"
@@ -655,47 +646,6 @@ def render_athlete_config_expander() -> dict:
 
 # ── Historical charts ─────────────────────────────────────────────────────────
 
-def _pace_ticks(series: pd.Series) -> tuple[list, list]:
-    lo = max(0, int(series.min()) - 30)
-    hi = int(series.max()) + 60
-    vals = list(range((lo // 30) * 30, ((hi // 30) + 2) * 30, 30))
-    texts = [f"{v // 60}:{v % 60:02d}" for v in vals]
-    return vals, texts
-
-
-def chart_running_trends(df: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=df["run_date"], y=df["distance_km"],
-        name="Distance (km)",
-        marker_color="rgba(55, 128, 191, 0.8)", yaxis="y1",
-    ))
-    pace = df["pace_sec_km"].dropna()
-    tick_vals, tick_texts = _pace_ticks(pace) if not pace.empty else ([], [])
-    fig.add_trace(go.Scatter(
-        x=df["run_date"], y=df["pace_sec_km"],
-        name="Pace", mode="lines+markers",
-        line=dict(color="#ff7f0e", width=2), marker=dict(size=7),
-        yaxis="y2",
-        hovertemplate="%{text}<extra></extra>",
-        text=[
-            f"{int(v) // 60}:{int(v) % 60:02d} min/km" if v else ""
-            for v in df["pace_sec_km"]
-        ],
-    ))
-    fig.update_layout(
-        title="Running Trends",
-        xaxis=dict(tickformat="%b %d"),
-        yaxis=dict(title="Distance (km)", showgrid=False),
-        yaxis2=dict(
-            title="Pace", overlaying="y", side="right",
-            autorange="reversed", tickvals=tick_vals, ticktext=tick_texts,
-        ),
-        legend=dict(orientation="h", y=1.12),
-        margin=dict(t=50, b=30, l=50, r=60),
-        height=300,
-    )
-    return fig
 
 
 def chart_hrv_body_battery(df: pd.DataFrame) -> go.Figure:
@@ -811,6 +761,56 @@ def chart_hydration(df: pd.DataFrame) -> go.Figure:
 
 # ── Dashboard tab ──────────────────────────────────────────────────────────────
 
+def _render_race_countdown(athlete_config: dict) -> None:
+    race_date_str = athlete_config.get("target_race_date")
+    target_pace = athlete_config.get("target_pace_min_per_km")
+    shoes = athlete_config.get("shoes", [])
+
+    has_race = race_date_str or target_pace
+    has_shoes = bool(shoes)
+    if not has_race and not has_shoes:
+        return
+
+    cols = []
+    if has_race:
+        cols = st.columns(2 + len(shoes)) if has_shoes else st.columns(2)
+    else:
+        cols = st.columns(len(shoes))
+
+    col_idx = 0
+    if race_date_str:
+        try:
+            race_date = datetime.date.fromisoformat(race_date_str)
+            days_left = (race_date - datetime.date.today()).days
+            label = f"{days_left}d to race" if days_left >= 0 else "Race day passed"
+            cols[col_idx].metric("Target Race", race_date.strftime("%b %d, %Y"), delta=label)
+            col_idx += 1
+        except ValueError:
+            pass
+
+    if target_pace:
+        total_sec = round(target_pace * 60)
+        pace_str = f"{total_sec // 60}:{total_sec % 60:02d} min/km"
+        cols[col_idx].metric("Target Pace", pace_str)
+        col_idx += 1
+
+    db = get_db()
+    for shoe in shoes:
+        start = shoe.get("start_date", "")
+        max_km = shoe.get("max_km", 600)
+        if not start or col_idx >= len(cols):
+            break
+        km_used = db.get_km_since(start)
+        pct = min(km_used / max_km, 1.0) if max_km else 0.0
+        color = "green" if pct < 0.70 else ("orange" if pct < 0.90 else "red")
+        with cols[col_idx]:
+            st.markdown(f"**{shoe['name']}**")
+            st.progress(pct, text=f":{color}[{km_used:.0f} / {max_km} km]")
+        col_idx += 1
+
+    st.divider()
+
+
 def render_dashboard(
     runs_df: pd.DataFrame,
     health_df: pd.DataFrame,
@@ -823,6 +823,8 @@ def render_dashboard(
     if runs_df.empty and health_df.empty:
         st.info("No data found. Run the data pipeline first.")
         return
+
+    _render_race_countdown(athlete_config)
 
     # ── Row 1: Load Balance | Intensity Distribution ───────────────────────────
     col_left, col_right = st.columns(2)
@@ -872,21 +874,11 @@ def render_dashboard(
 
     # ── Row 3: Historical trends ───────────────────────────────────────────────
     st.subheader("Historical Trends")
-    h_col1, h_col2 = st.columns(2)
-
-    with h_col1:
-        _section_header("Running Trends", "running_trends")
-        if not runs_df.empty:
-            st.plotly_chart(chart_running_trends(runs_df), use_container_width=True)
-        else:
-            st.warning("No run data.")
-
-    with h_col2:
-        _section_header("HRV & Body Battery", "hrv_battery")
-        if not health_df.empty:
-            st.plotly_chart(chart_hrv_body_battery(health_df), use_container_width=True)
-        else:
-            st.warning("No HRV / Body Battery data.")
+    _section_header("HRV & Body Battery", "hrv_battery")
+    if not health_df.empty:
+        st.plotly_chart(chart_hrv_body_battery(health_df), use_container_width=True)
+    else:
+        st.warning("No HRV / Body Battery data.")
 
     h_col3, h_col4, h_col5 = st.columns(3)
     with h_col3:

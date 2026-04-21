@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 import duckdb
+import pandas as pd
 
 # Project root (two levels up: src/db/ -> src/ -> root)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -434,7 +435,7 @@ class StarkDatabase:
                     COUNT(*)                                AS run_count,
                     SUM(total_dist_m) / 1000.0              AS total_km
                 FROM run_zones
-                WHERE easy_fraction >= 0.70
+                WHERE avg_hr < {z2}
                 GROUP BY DATE_TRUNC('week', run_date)::DATE
                 ORDER BY week_start DESC
                 LIMIT ?
@@ -496,6 +497,44 @@ class StarkDatabase:
             logger.error(f"Failed to retrieve training load history: {e}")
             return []
 
+    def get_hr_profile(self, lthr: Optional[int] = None) -> dict:
+        """
+        Returns the athlete's heart rate profile derived from observed run data.
+        max_hr_observed: highest HR recorded across all runs (best proxy for HRmax).
+        Also returns LTHR and Friel zone thresholds when LTHR is configured.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT MAX(heart_rate) AS max_hr FROM gold_runs WHERE heart_rate IS NOT NULL"
+            ).fetchone()
+            max_hr = int(row[0]) if row and row[0] else None
+        except Exception as e:
+            logger.error(f"Failed to get max HR: {e}")
+            max_hr = None
+
+        profile: dict = {"max_hr_observed_bpm": max_hr}
+
+        if lthr and lthr > 0:
+            z1, z2, z3, z4 = _zone_thresholds(lthr)
+            profile["lthr_bpm"] = lthr
+            profile["zones_friel"] = {
+                "z1_recovery": f"< {z1} bpm",
+                "z2_aerobic_base": f"{z1}–{z2 - 1} bpm",
+                "z3_tempo": f"{z2}–{z3 - 1} bpm",
+                "z4_threshold": f"{z3}–{z4 - 1} bpm",
+                "z5_vo2max": f">= {z4} bpm",
+            }
+
+        if max_hr:
+            # Standard 80% of HRmax for easy/aerobic ceiling
+            profile["aerobic_ceiling_80pct_bpm"] = round(max_hr * 0.80)
+            profile["note"] = (
+                "max_hr_observed is the highest HR recorded in any run — "
+                "use as proxy for HRmax until a lab test is available."
+            )
+
+        return profile
+
     def get_km_since(self, start_date: str) -> float:
         """Returns total km run from gold_runs on or after start_date."""
         query = """
@@ -513,6 +552,183 @@ class StarkDatabase:
         except Exception as e:
             logger.error(f"Failed to calculate km since {start_date}: {e}")
             return 0.0
+
+    def get_readiness_snapshot(self, today: str) -> dict:
+        """
+        Pre-computed recovery summary for the J.A.R.V.I.S. unified agent.
+        Returns today's biometrics alongside 7-day averages and deltas — ready
+        for the LLM to interpret without further arithmetic.
+        """
+        rows = self.get_health_trend(days=8)
+        if not rows:
+            return {"status": "no_data", "message": "No health telemetry found."}
+
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+
+        today_date = date.fromisoformat(today)
+        today_row = df[df["date"] == today_date]
+        past_7 = df[df["date"] < today_date].tail(7)
+
+        def _val(series, col):
+            v = series[col].dropna()
+            return round(float(v.iloc[-1]), 1) if not v.empty else None
+
+        def _avg(frame, col):
+            v = frame[col].dropna()
+            return round(float(v.mean()), 1) if not v.empty else None
+
+        def _delta(today_val, avg_val):
+            if today_val is not None and avg_val is not None:
+                return round(today_val - avg_val, 1)
+            return None
+
+        hrv_today = _val(today_row, "hrv_last_night_avg") if not today_row.empty else None
+        hrv_avg   = _avg(past_7, "hrv_last_night_avg")
+        rhr_today = _val(today_row, "resting_heart_rate") if not today_row.empty else None
+        rhr_avg   = _avg(past_7, "resting_heart_rate")
+        bb_today  = _val(today_row, "body_battery_end") if not today_row.empty else None
+        bb_avg    = _avg(past_7, "body_battery_end")
+        sleep_today = _val(today_row, "sleep_score") if not today_row.empty else None
+        sleep_avg   = _avg(past_7, "sleep_score")
+
+        hrv_status = today_row["hrv_status"].iloc[0] if not today_row.empty and today_row["hrv_status"].notna().any() else None
+
+        return {
+            "date": today,
+            "hrv_ms": hrv_today,
+            "hrv_7d_avg_ms": hrv_avg,
+            "hrv_delta_ms": _delta(hrv_today, hrv_avg),
+            "hrv_status": hrv_status,
+            "rhr_bpm": rhr_today,
+            "rhr_7d_avg_bpm": rhr_avg,
+            "rhr_delta_bpm": _delta(rhr_today, rhr_avg),
+            "body_battery": bb_today,
+            "body_battery_7d_avg": bb_avg,
+            "sleep_score": sleep_today,
+            "sleep_score_7d_avg": sleep_avg,
+            "sleep_delta": _delta(sleep_today, sleep_avg),
+        }
+
+    def get_training_load_snapshot(self, lthr: Optional[int] = None) -> dict:
+        """
+        Pre-computed ATL/CTL/TSB snapshot for the J.A.R.V.I.S. unified agent.
+        Returns the latest load metrics and a human-readable risk label.
+        Requires LTHR for hrTSS calculation; falls back to zero TSS when not available.
+        """
+        rows = self.get_training_load_history(days=42)
+        if not rows or not lthr or lthr <= 0:
+            return {"status": "no_data", "message": "No training load data or LTHR not configured."}
+
+        df = pd.DataFrame(rows)
+        df["run_date"] = pd.to_datetime(df["run_date"])
+
+        def _tss(row) -> float:
+            duration = row["duration_sec"] or 0
+            if duration <= 0:
+                return 0.0
+            avg_power = row.get("avg_power_w")
+            ftp = row.get("ftp_proxy_w")
+            if avg_power and avg_power > 0 and ftp and ftp > 0:
+                intensity_factor = avg_power / ftp
+                return round((duration * avg_power * intensity_factor) / (ftp * 3600) * 100, 1)
+            hr_num = row.get("hr_tss_numerator") or 0
+            return round(hr_num / (lthr ** 2 * 3600) * 100, 1)
+
+        df["tss"] = df.apply(_tss, axis=1)
+
+        full_range = pd.date_range(
+            start=df["run_date"].min(),
+            end=pd.Timestamp.today().normalize(),
+            freq="D",
+        )
+        spine = pd.DataFrame({"date": full_range})
+        daily = df.groupby("run_date")["tss"].sum().reset_index()
+        daily.columns = ["date", "tss"]
+        merged = spine.merge(daily, on="date", how="left").fillna(0)
+
+        merged["atl"] = merged["tss"].ewm(span=7, adjust=False).mean().round(1)
+        merged["ctl"] = merged["tss"].rolling(42, min_periods=1).mean().round(1)
+        merged["tsb"] = (merged["ctl"] - merged["atl"]).round(1)
+
+        latest = merged.iloc[-1]
+        ctl, atl, tsb = latest["ctl"], latest["atl"], latest["tsb"]
+        ratio = round(atl / ctl, 2) if ctl > 0 else None
+
+        if tsb > 10:
+            form_label, risk = "Fresh / Race-ready", "low"
+        elif tsb > 0:
+            form_label, risk = "Neutral / Maintaining", "low"
+        elif tsb > -10:
+            form_label, risk = "Productive Overreach", "moderate"
+        elif tsb > -25:
+            form_label, risk = "High Fatigue", "high"
+        else:
+            form_label, risk = "Overtraining Risk", "critical"
+
+        if ratio is not None:
+            if ratio > 1.5:
+                load_risk = "red — injury risk elevated"
+            elif ratio > 1.3:
+                load_risk = "amber — monitor closely"
+            else:
+                load_risk = "green — safe range"
+        else:
+            load_risk = "unknown"
+
+        return {
+            "ctl_fitness": round(ctl, 1),
+            "atl_fatigue": round(atl, 1),
+            "tsb_form": round(tsb, 1),
+            "form_label": form_label,
+            "injury_risk": risk,
+            "acr_ratio": ratio,
+            "acr_status": load_risk,
+            "tss_today": round(float(latest["tss"]), 1),
+        }
+
+    def get_biomechanics_snapshot(self, lthr: Optional[int] = None) -> list:
+        """
+        Condensed biomechanics summary for the J.A.R.V.I.S. unified agent.
+        Returns last 3 runs with pre-computed drift fields and human-readable
+        flag labels — no raw row data that forces the LLM to do arithmetic.
+        """
+        from src.models.biometrics import format_pace
+        rows = self.get_run_biomechanics(limit=3, lthr=lthr)
+        if not rows:
+            return []
+
+        result = []
+        for row in rows:
+            cadence_drift = None
+            hr_drift = None
+            if row.get("cadence_last_third_spm") and row.get("cadence_first_third_spm"):
+                cadence_drift = round(row["cadence_last_third_spm"] - row["cadence_first_third_spm"], 1)
+            if row.get("hr_last_third") and row.get("hr_first_third"):
+                hr_drift = round(row["hr_last_third"] - row["hr_first_third"], 1)
+
+            result.append({
+                "run_date": str(row["run_date"])[:10],
+                "distance_km": round((row["total_distance_m"] or 0) / 1000, 2),
+                "duration_min": round(row["duration_min"] or 0, 1),
+                "avg_pace": format_pace(row.get("avg_speed_m_s") or 0),
+                "avg_cadence_spm": row["avg_cadence_spm"],
+                "avg_vo_mm": row["avg_vo_mm"],
+                "avg_vr_pct": row["avg_vr_pct"],
+                "avg_gct_ms": row["avg_gct_ms"],
+                "avg_step_length_mm": row["avg_step_length_mm"],
+                "avg_power_w": row["avg_power_w"],
+                "avg_hr": row["avg_hr"],
+                "hr_zones_pct": {
+                    "z1": row["pct_z1"], "z2": row["pct_z2"], "z3": row["pct_z3"],
+                    "z4": row["pct_z4"], "z5": row["pct_z5"],
+                },
+                "cadence_drift_spm": cadence_drift,
+                "hr_drift_bpm": hr_drift,
+                "pace_first_third": format_pace(row.get("speed_first_third_m_s") or 0),
+                "pace_last_third": format_pace(row.get("speed_last_third_m_s") or 0),
+            })
+        return result
 
     def close(self) -> None:
         """Shuts down the Arc Reactor safely."""

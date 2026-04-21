@@ -26,7 +26,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from src.agents.orchestrator import agent as orchestrator
+from src.agents.jarvis_agent import agent as orchestrator, build_context
 
 logger = logging.getLogger("src.chat.fastapi_app")
 
@@ -294,20 +294,20 @@ async def chat(request: Request):
     logger.info("session=%s | user: %s", session_id, user_message[:80])
 
     async def event_stream():
-        new_history: list = []
         try:
-            async with orchestrator.run_stream(
-                user_message, message_history=history
-            ) as result:
-                async for chunk in result.stream_text(delta=True):
-                    yield "data: " + json.dumps({"delta": chunk}) + "\n\n"
-                new_history.extend(result.all_messages())
+            ctx = build_context()
+            result = await orchestrator.run(ctx + user_message, message_history=history)
+            text: str = result.output or ""
+            # Stream the completed text in small chunks so the UI feels responsive
+            chunk_size = 12
+            for i in range(0, len(text), chunk_size):
+                yield "data: " + json.dumps({"delta": text[i:i + chunk_size]}) + "\n\n"
+            _sessions[session_id] = result.all_messages()
         except Exception as e:
             logger.error("Orchestrator error: %s", e, exc_info=True)
             yield "data: " + json.dumps({"delta": f"\n\n⚠️ Error: {e}"}) + "\n\n"
 
         yield "data: [DONE]\n\n"
-        _sessions[session_id] = new_history
 
     response = StreamingResponse(
         event_stream(),

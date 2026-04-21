@@ -1,151 +1,251 @@
-# ⚡️ S.T.A.R.K.
+# ⚡ S.T.A.R.K.
 **Smart Training & Athletic Readiness Kernel**
 
-> *"J.A.R.V.I.S., bring up my biometric telemetry and plot a course for a sub-1:45 Half Marathon."*
+> *"J.A.R.V.I.S., bring up my biometric telemetry and plot a course for a sub-1:59 Half Marathon."*
 
-S.T.A.R.K. is a localized, AI-driven data engineering pipeline and multi-agent orchestration system designed to optimize athletic performance. It ingests raw biometric telemetry (Garmin wearables, sleep data, subjective mood, and pain inputs), processes it through a local OLAP engine, and utilizes LLM-based agents with strict data contracts to generate dynamic, highly personalized training blocks.
+S.T.A.R.K. is a local data engineering pipeline and single-agent AI system for athletic performance optimization. It ingests raw biometric telemetry from Garmin wearables, processes it through a Medallion Architecture (Bronze → Silver → Gold), and exposes it to a unified LLM agent that acts as a panel of experts — physiologist, biomechanics coach, and sports nutritionist — in a single fast response.
 
-## 🏗 System Architecture
+---
 
-This project implements a localized Medallion Architecture (Bronze -> Silver -> Gold) combined with an Agentic Workflow:
+## System Architecture
 
-1. **Ingestion (The Sensors):** Automated extraction of `.FIT` files, daily sleep scores, and HRV data via the unofficial Garmin API (`garminconnect`).
-2. **Storage & Compute (The Arc Reactor):** In-memory and local disk processing using **DuckDB**. Raw JSONs and binary `.FIT` files are transformed into queried views and Parquet files for fast analytical read loads.
-3. **Data Contracts (The Suit):** **Pydantic** models ensure strict type-checking and validation. LLMs are forced to output structured JSON matching these models, preventing hallucinations in training plans.
-4. **Agent Orchestration (J.A.R.V.I.S.):** A master LLM agent that routes context to specialized sub-agents:
-    * 🏃🏽‍♂️ **Coach Agent:** Analyzes pacing, VO2 Max, and mileage to prescribe specific workouts.
-    * 🩺 **Physio Agent:** Reviews sleep data, HRV, and subjective pain inputs to adjust load and prevent injury.
-    * 💧 **Nutrition Agent:** Recommends hydration and fueling strategies based on upcoming long runs.
+```
+Garmin API / .FIT files
+        │
+        ▼
+  Bronze (data/raw/)          Raw JSONs + .FIT ZIPs
+        │  garmin.py
+        ▼
+  Silver (data/processed/)    Parquet files
+        │  transformations.py
+        ▼
+  Gold (DuckDB in-memory)     Views + aggregation queries
+        │  connection.py
+        ▼
+  J.A.R.V.I.S. Agent          1 LLM call, 4 tools
+        │  jarvis_agent.py
+        ▼
+  FastAPI SSE chat (port 7934) + Streamlit dashboard (port 8501)
+```
 
-## 🛠 Tech Stack
+### Agent design — single LLM call
 
-* **Language:** Python 3.11+
-* **Package Manager:** `uv`
-* **Data Extraction:** `garminconnect`, `fitparse`, `pyarrow`
-* **Local Data Warehouse:** `DuckDB` (OLAP)
-* **Data Validation & Agent Tooling:** `Pydantic`, `pydantic-ai`
-* **Agent UI:** `Chainlit`
-* **LLM Backend:** `Gemini` (`gemini-3.1-pro-preview` via `pydantic-ai`)
-* **Visualization:** `Pandas`, `Plotly`
-* **Environment Management:** `python-dotenv`
-* **Testing:** `Pytest`
+J.A.R.V.I.S. is a single pydantic-ai agent with four DuckDB-backed tools that return pre-aggregated snapshots. There are no sub-agent chains. One user message = one LLM call.
 
-## 📂 Repository Structure
+```
+User message
+    │
+    ▼
+jarvis_agent  (1 LLM call)
+    ├── get_readiness_snapshot()      HRV / RHR / Body Battery / Sleep + 7d deltas
+    ├── get_training_load_snapshot()  ATL / CTL / TSB / ACR ratio + risk label
+    ├── get_biomechanics_snapshot()   Last 3 runs: cadence, GCT, VO, VR, drift
+    └── get_athlete_profile()         Race date, target pace, shoe mileage
+    │
+    ▼
+Synthesized response (plain text, J.A.R.V.I.S. tone)
+```
 
-```text
-S.T.A.R.K./
-├── data/                           # Local Data Lakehouse (git-ignored)
-│   ├── raw/                        # Bronze: Raw Garmin JSONs & .FIT ZIPs
-│   ├── processed/                  # Silver: Cleansed Parquet files
-│   └── duckdb/                     # Gold: runner_data.db (DuckDB)
+Specialist agents (`planner_agent`, `biomechanics_agent`) remain available on their own ports for direct access and development.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Python 3.11+ |
+| Package manager | `uv` |
+| Data extraction | `garminconnect`, `fitparse`, `pyarrow` |
+| Local data warehouse | `DuckDB` (in-memory, OLAP) |
+| Data validation | `Pydantic` |
+| Agent framework | `pydantic-ai` |
+| LLM | `Gemini` via `pydantic-ai` (`GoogleModel`) |
+| Dashboard | `Streamlit` + `Plotly` |
+| Chat API | `FastAPI` (SSE streaming) |
+| Auth automation | `Playwright` (Chromium) |
+| Testing | `Pytest` |
+
+---
+
+## Repository Structure
+
+```
+STARK/
+├── data/                               # Local data lakehouse (git-ignored)
+│   ├── raw/                            # Bronze: raw Garmin JSONs & .FIT ZIPs
+│   ├── processed/                      # Silver: cleansed Parquet files
+│   ├── athlete_config.json             # Athlete profile (LTHR, pace, shoes)
+│   └── daily_inputs.json               # Daily soreness log, keyed by date
+├── docs/
+│   ├── agents_ideas.md                 # Design notes — panel of experts concept
+│   ├── dashboard_feedback.md           # Dashboard design feedback
+│   └── orchestrator_plan.md            # Agent architecture history & decisions
 ├── scripts/
-│   └── garmin_auth.py              # One-time Playwright auth — run before the extractor
+│   └── garmin_auth.py                  # One-time Playwright browser auth
 ├── src/
 │   ├── config/
-│   │   └── logging_config.py       # Centralized logging setup (call once from main.py)
+│   │   ├── agents.py                   # GoogleModel factory (get_google_model)
+│   │   └── logging_config.py           # Centralized logging — setup_logging()
 │   ├── extractors/
-│   │   └── garmin.py               # Garmin API client: sleep, health telemetry, .FIT runs
+│   │   └── garmin.py                   # Garmin API: sleep, health telemetry, .FIT runs
 │   ├── db/
-│   │   ├── transformations.py      # Bronze → Silver: JSON/FIT → Parquet
-│   │   └── connection.py           # Silver → Gold: DuckDB views & query interface
+│   │   ├── transformations.py          # Bronze → Silver: JSON/FIT → Parquet
+│   │   └── connection.py               # Silver → Gold: DuckDB views, StarkDatabase,
+│   │                                   # aggregation tools, athlete config persistence
 │   ├── models/
-│   │   ├── biometrics.py           # DailyReadiness, RunSummary, AthleteContext
-│   │   └── workouts.py             # Workout plan models — WIP
-│   └── agents/
-│       └── planner_agent.py        # J.A.R.V.I.S. planner agent — WIP
+│   │   ├── biometrics.py               # DailyReadiness, RunSummary, BiomechanicsReport
+│   │   └── workouts.py                 # DailyActionPlan, WorkoutInterval
+│   ├── agents/
+│   │   ├── jarvis_agent.py             # Unified J.A.R.V.I.S. agent — primary entry point
+│   │   ├── orchestrator.py             # Legacy orchestrator (routing chain) — kept for reference
+│   │   ├── planner_agent.py            # Training planner specialist — port 7932
+│   │   └── biomechanics_agent.py       # Biomechanics specialist — port 7933
+│   └── chat/
+│       └── fastapi_app.py              # FastAPI SSE chat UI — port 7934
 ├── tests/
 │   ├── test_extractors.py
 │   ├── test_transformations.py
 │   ├── test_connection.py
+│   ├── test_connection_queries.py
 │   └── test_biometrics.py
-├── .env.example                    # Template for secrets
-├── pyproject.toml
-└── main.py                         # System entry point
+├── main.py                             # Streamlit dashboard — port 8501
+└── pyproject.toml
 ```
 
-## 🚀 Setup
+---
+
+## Setup
 
 **Prerequisites:** Python 3.11+, [`uv`](https://github.com/astral-sh/uv)
 
 ```bash
-# Clone and install dependencies
 git clone <repo-url>
 cd STARK
 uv sync
 
-# Install Playwright's Chromium browser (required for auth)
+# Install Playwright's Chromium browser (required for Garmin auth)
 uv run playwright install chromium
-
-# Configure credentials
-cp .env.example .env
-# Edit .env with your Garmin email and password
 ```
 
-`.env` required variables:
+Create a `.env` file in the project root:
+
 ```
 GARMIN_EMAIL=your@email.com
 GARMIN_PASSWORD=yourpassword
+GOOGLE_API_KEY=your_google_ai_key
 ```
 
-## ⚙️ Running the Pipeline
+---
 
-### First-time authentication
+## Running
 
-Garmin's SSO blocks headless/automated login attempts. Run this **once** to authenticate via a real browser and save the session tokens locally:
+### First-time Garmin authentication
+
+Garmin's SSO blocks headless login. Run this once to authenticate via a real browser and save session tokens to `~/.garminconnect/`:
 
 ```bash
 uv run python scripts/garmin_auth.py
 ```
 
-A Chromium window will open — log in manually. Tokens are saved to `~/.garminconnect/` and reused automatically on every subsequent run.
-
-### Data pipeline
-
-Each step can be run independently:
+### Dashboard (Streamlit)
 
 ```bash
-# 1. Extract raw data from Garmin (Bronze layer)
-uv run python src/extractors/garmin.py
-
-# 2. Transform raw data into Parquet (Bronze → Silver)
-uv run python src/db/transformations.py
-
-# 3. Query the Gold layer via DuckDB
-uv run python src/db/connection.py
+streamlit run main.py
+# Opens at http://localhost:8501
 ```
 
-## 📊 Data Extracted
+The dashboard includes a "Sync Data" button that runs the full extraction + transformation pipeline in-browser.
 
-### Bronze layer (`data/raw/`)
+### J.A.R.V.I.S. chat (FastAPI)
 
-| File pattern | Source | Description |
+```bash
+uv run python -m uvicorn src.chat.fastapi_app:app --port 7934 --reload
+# Opens at http://localhost:7934
+```
+
+The chat UI is also embedded in the J.A.R.V.I.S. tab of the Streamlit dashboard.
+
+### Specialist agents (direct access / development)
+
+```bash
+uv run python src/agents/planner_agent.py        # port 7932
+uv run python src/agents/biomechanics_agent.py   # port 7933
+```
+
+### Run the pipeline manually (without Streamlit)
+
+```bash
+# 1. Extract raw data from Garmin → Bronze layer
+uv run python src/extractors/garmin.py
+
+# 2. Transform raw data → Silver layer (Parquet)
+uv run python src/db/transformations.py
+```
+
+---
+
+## Data Layers
+
+### Bronze (`data/raw/`)
+
+| File pattern | Description |
+|---|---|
+| `sleep_data_YYYY-MM-DD.json` | Raw sleep session from Garmin API |
+| `health_telemetry_YYYY-MM-DD.json` | HRV, body battery, stress, VO2 Max, steps |
+| `run_YYYY-MM-DD_<id>.zip` | Original `.FIT` binary (second-by-second telemetry) |
+
+### Silver (`data/processed/`)
+
+| File | Key columns |
+|---|---|
+| `silver_sleep_data.parquet` | `date`, `sleep_score`, `deep/rem/light/awake_seconds`, `avg_heart_rate`, `avg_stress` |
+| `silver_health_telemetry.parquet` | `date`, `resting_heart_rate`, `hrv_last_night_avg`, `hrv_status`, `body_battery_end`, `vo2_max` |
+| `silver_run_<id>.parquet` | `timestamp`, `distance`, `heart_rate`, `cadence`, `power`, `enhanced_speed`, `vertical_oscillation`, `vertical_ratio`, `stance_time`, `step_length` |
+| `silver_hydration.parquet` | `date`, `intake_ml`, `goal_ml`, `sweat_loss_ml` |
+
+### Gold (DuckDB in-memory)
+
+| View | Source |
+|---|---|
+| `gold_sleep` | `silver_sleep_data.parquet` |
+| `gold_health` | `silver_health_telemetry.parquet` |
+| `gold_runs` | All `silver_run_*.parquet` (union by name) |
+| `gold_hydration` | `silver_hydration.parquet` |
+
+The database is **in-memory** (`:memory:`) to allow Streamlit and FastAPI to run simultaneously without file-lock conflicts.
+
+---
+
+## Dashboard Sections
+
+| Section | Data source | What it shows |
 |---|---|---|
-| `sleep_data_YYYY-MM-DD.json` | Garmin API | Raw sleep session data |
-| `health_telemetry_YYYY-MM-DD.json` | Garmin API | HRV, body battery, stress, VO2 Max, steps |
-| `run_YYYY-MM-DD_<id>.zip` | Garmin API | Original `.FIT` binary file (second-by-second telemetry) |
+| Sidebar — Daily Readiness | `get_health_trend(7)` | HRV, RHR, Body Battery, Sleep vs 7d avg + soreness slider |
+| Race Countdown | `athlete_config.json` | Days to race, target pace, shoe mileage % |
+| Load Balance | `get_training_load_history(42)` | ATL / CTL / TSB — requires LTHR |
+| Intensity Distribution | `get_weekly_intensity(2)` | % time per HR zone vs 80/20 target |
+| Run Efficiency | `get_efficiency_trend(16)` | Pace vs HR on easy runs (avg HR < Z3 threshold) |
+| Historical Trends | `get_health_trend(30)` | HRV/Battery, RHR, Sleep Score, Hydration |
 
-### Silver layer (`data/processed/`)
+---
 
-| File | Columns |
-|---|---|
-| `silver_sleep_data.parquet` | `date`, `sleep_time_seconds`, `deep/light/rem/awake_sleep_seconds`, `sleep_score`, `sleep_score_qualifier`, `avg_heart_rate`, `avg_respiration`, `avg_spo2`, `avg_stress`, `sleep_score_feedback` |
-| `silver_health_telemetry.parquet` | `date`, `resting_heart_rate`, `avg_stress_level`, `steps`, `active_calories`, `total_distance_meters`, `hrv_weekly_avg`, `hrv_last_night_avg`, `hrv_status`, `body_battery_end`, `training_status_phrase`, `vo2_max` |
-| `silver_run_<id>.parquet` | `timestamp`, `distance`, `heart_rate`, `cadence`, `power`, `enhanced_speed`, `enhanced_altitude`, `position_lat`, `position_long`, `temperature`, `vertical_oscillation`, `vertical_ratio`, `stance_time`, `step_length`, ... |
+## Port Registry
 
-### Gold layer (`data/duckdb/runner_data.db`)
+| Service | Port | Notes |
+|---|---|---|
+| Streamlit dashboard | 8501 | `streamlit run main.py` |
+| FastAPI chat (J.A.R.V.I.S.) | 7934 | Unified agent, embedded in dashboard |
+| Planner agent | 7932 | Direct access / development |
+| Biomechanics agent | 7933 | Direct access / development |
+| Next specialist | 7935 | — |
 
-DuckDB views defined in `src/db/connection.py`:
+---
 
-| View | Description |
-|---|---|
-| `gold_sleep` | Wraps `silver_sleep_data.parquet` |
-| `gold_health` | Wraps `silver_health_telemetry.parquet` |
-| `gold_runs` | Union of all `silver_run_*.parquet` files with `union_by_name=true` |
-
-## 🧪 Tests
+## Tests
 
 ```bash
 uv run pytest tests/ -v
 ```
 
-27 tests covering extractors (Garmin API mocking), transformations (JSON → Parquet), DuckDB connection layer, and Pydantic biometric models.
+Covers: Garmin API extraction (mocked), Bronze → Silver transformations, DuckDB connection layer, aggregation queries (intensity, efficiency, load, km_since), and Pydantic biometric models.

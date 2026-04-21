@@ -1,211 +1,125 @@
-# Orchestrator — Design & Work Plan
-
-**Status:** Phase 1 complete — MVP running  
-**Supersedes:** Manual per-agent execution on separate ports
+# Agent Architecture — Design History & Decisions
 
 ---
 
-## Context
+## Current architecture (Phase 2 — Unified agent)
 
-STARK currently has two specialist agents (`planner_agent`, `biomechanics_agent`) each
-running on their own port and started separately. The goal is a single entry point that
-understands the user's intent, routes to the right specialist(s), and synthesizes a
-coherent response — without the user changing ports or execution contexts.
+**Status:** Active  
+**Entry point:** `src/agents/jarvis_agent.py` → `src/chat/fastapi_app.py` (port 7934)
 
-Planned future specialists: hydration, stress/HRV analysis, training theory.
+### Problem with the orchestrator chain
 
----
-
-## Architecture decision
-
-**Chosen: In-process orchestrator with per-specialist tools.**
-
-The orchestrator is itself a pydantic-ai `Agent`. Each specialist is called via a tool
-function that invokes `specialist_agent.run(contextual_prompt)` directly in Python —
-no HTTP, no subprocesses, one port.
+The Phase 1 orchestrator reduced latency vs. calling agents directly via HTTP, but still
+produced 3 LLM calls per user message in the common case:
 
 ```
-User input
+User → Orchestrator LLM (decides routing)
+           → planner_agent.run()       ← LLM call #2
+           → biomechanics_agent.run()  ← LLM call #3
+       → Orchestrator LLM (synthesizes)
+```
+
+Minimum 6–9 seconds per response. The root cause: sub-agents were full LLMs, not data
+functions. The LLM was doing arithmetic that Python could do in milliseconds.
+
+### Solution: aggregation tools + single agent
+
+Replace sub-agent calls with DuckDB-backed Python functions that return pre-computed
+summaries. One user message = one LLM call.
+
+```
+User message
     │
     ▼
-Orchestrator Agent  (LLM decides routing)
-    ├── tool: consult_biomechanics_agent(focus)
-    ├── tool: consult_planner_agent(context)
-    ├── tool: consult_hydration_agent(...)       ← future
-    ├── tool: consult_stress_agent(...)          ← future
-    └── tool: consult_training_theory_agent(...) ← future
+jarvis_agent  (1 LLM call)
+    ├── get_readiness_snapshot()      HRV/RHR/BB/Sleep + 7d deltas, soreness
+    ├── get_training_load_snapshot()  ATL/CTL/TSB, ACR ratio, risk label
+    ├── get_biomechanics_snapshot()   Last 3 runs with drift pre-computed
+    └── get_athlete_profile()         Race date, target pace, shoe % life
     │
     ▼
-Synthesized response → Starlette chat (port 7931) + CLI REPL
+Synthesized plain-text response
 ```
 
-### Why not a generic `delegate(agent_name, prompt)` tool
+### Aggregation tool design principle
 
-A single generic tool forces the LLM to reason about available agents from the system
-prompt alone, with no schema-level guidance. Per-specialist tools give the LLM explicit
-docstrings describing *when* and *why* to use each one — much better routing quality.
-
-### Why not multi-process / HTTP
-
-Unnecessary complexity for a local personal tool. All agents share the same process and
-API key. HTTP would add startup dependencies and latency with zero benefit at this scale.
-
----
-
-## Key design decisions
-
-### Agent initialization — eager at orchestrator startup
-
-All specialists are built when the orchestrator module loads. Startup is slightly slower
-but avoids lazy-init complexity. Acceptable for a personal tool with a single user.
+The tools return interpreted summaries, not raw rows. Example from
+`get_training_load_snapshot`:
 
 ```python
-# orchestrator.py (module level)
-from src.agents.biomechanics_agent import agent as biomechanics_agent
-from src.agents.planner_agent      import agent as planner_agent
+# Returned to LLM — no arithmetic needed
+{
+    "ctl_fitness": 42.3,
+    "atl_fatigue": 61.7,
+    "tsb_form": -19.4,
+    "form_label": "High Fatigue",
+    "injury_risk": "high",
+    "acr_ratio": 1.46,
+    "acr_status": "amber — monitor closely",
+}
 ```
 
-### Orchestrator output type — `str` (free text)
+This prevents the LLM from having to compute TSB or classify risk levels — it just reads
+the label and reasons about it.
 
-The orchestrator is conversational. Structured output adds friction without benefit at
-the routing layer. Specialists already enforce structure via their own output models.
-If the UI later needs to show which agents were called, add a thin wrapper model then.
+### System prompt — panel of experts
 
-### Context passed to sub-agents
+J.A.R.V.I.S. operates as three integrated lenses in a single system prompt rather than
+three separate agents. The lenses are never addressed as separate voices; they inform a
+single synthesized output:
 
-Each tool constructs a self-contained prompt that includes:
-- The user's intent (paraphrased from the orchestrator's understanding)
-- Today's date
-- Any relevant constraints extracted from the conversation
-
-Sub-agents are stateless; the orchestrator holds conversation history.
-
-### Routing logic lives in the system prompt
-
-The orchestrator's system prompt describes each available agent, its domain, and the
-signals that indicate it should be called. As new agents are added:
-1. Add import + tool function to `orchestrator.py`
-2. Add one bullet to the orchestrator's system prompt describing the new agent
-3. No other changes required to existing code
+- **Physiologist** — governs session type based on HRV/RHR/BB/soreness signals
+- **Biomechanics coach** — reads cadence drift, GCT, VO, VR for form and fatigue signals
+- **Sports nutritionist** — triggers carbohydrate/hydration prescriptions based on load
 
 ---
 
-## Port registry (updated)
+## Phase 1 — Orchestrator chain (legacy, kept for reference)
 
-| Agent                  | Port | Notes                        |
-|------------------------|------|------------------------------|
-| `orchestrator.py`      | 7931 | Primary entry point          |
-| `planner_agent.py`     | 7932 | Direct access / development  |
-| `biomechanics_agent.py`| 7933 | Direct access / development  |
-| Next specialist        | 7934 | —                            |
+**File:** `src/agents/orchestrator.py`  
+**Status:** Not used by `fastapi_app.py`. Available for direct CLI use.
 
----
+The orchestrator was a pydantic-ai Agent with two tools that invoked sub-agents as full
+LLM calls. This was the right intermediate step — it established the single-port entry
+point and synthesized responses — but the sub-agent latency was the bottleneck.
 
-## File plan
-
-### New files
-| File | Purpose |
-|------|---------|
-| `src/agents/orchestrator.py` | Central router agent, dual interface |
-
-### Modified files
-| File | Change |
-|------|--------|
-| `CLAUDE.md` | Add orchestrator port (7931) to port registry |
-
-### No changes needed
-`planner_agent.py` and `biomechanics_agent.py` already expose `agent` at module level.
-The orchestrator imports and calls them directly.
+It remains in the repo because:
+- The specialist agents (`planner_agent`, `biomechanics_agent`) it calls are still valid
+  and useful for direct development access on their own ports
+- The routing logic in its system prompt is a useful reference for how the domain split
+  was originally conceived
 
 ---
 
-## Implementation — Phase 1 (MVP)
+## Port registry
 
-### Step 1 — `src/agents/orchestrator.py`
-
-Structure following the agent file convention from CLAUDE.md:
-
-```python
-from src.agents.biomechanics_agent import agent as biomechanics_agent
-from src.agents.planner_agent      import agent as planner_agent
-
-SYSTEM_PROMPT = """
-You are J.A.R.V.I.S., the master coordination layer of S.T.A.R.K.
-Your job is to understand the athlete's query and delegate to the right
-specialist(s). You synthesize their outputs into a single, coherent response.
-
-Available specialists — call the ones relevant to the query:
-  - consult_biomechanics_agent: running mechanics, cadence, vertical oscillation,
-    ground contact time, stride length, fatigue drift, efficiency trends.
-    Use when: user asks about how they ran, form, technique, mechanics.
-  - consult_planner_agent: daily training plan, readiness, rest vs. train decision,
-    workout prescription, hydration, nutrition for a session.
-    Use when: user asks what to do today/tomorrow or wants a training plan.
-
-Rules:
-  - Call only the specialists needed. Do not call all of them for every query.
-  - If a query spans multiple domains (e.g. "how did I run and what should I do
-    tomorrow?"), call all relevant specialists and synthesize their outputs.
-  - Never invent data. If a specialist returns no data, say so clearly.
-  - Tone: direct, analytical, slightly witty — J.A.R.V.I.S. from Iron Man.
-"""
-
-# Tool: consult_biomechanics_agent(focus)
-# Tool: consult_planner_agent(target_date)
-
-# Starlette app on port 7931
-# CLI REPL via __main__
-```
-
-### Step 2 — CLI REPL
-
-```bash
-uv run python src/agents/orchestrator.py
-# >>> Analyze my last 3 runs
-# >>> What should I do tomorrow?
-# >>> exit
-```
-
-Single-shot mode:
-```bash
-uv run python src/agents/orchestrator.py "how did I run this week?"
-```
-
-### Step 3 — Update CLAUDE.md port registry
-
-Add `orchestrator.py → 7931` to the ports table.
+| Service | Port | Notes |
+|---|---|---|
+| Streamlit dashboard | 8501 | `streamlit run main.py` |
+| FastAPI chat (J.A.R.V.I.S.) | 7934 | `jarvis_agent` — primary chat entry point |
+| Planner agent | 7932 | Direct access / development |
+| Biomechanics agent | 7933 | Direct access / development |
+| Next specialist | 7935 | — |
 
 ---
 
-## Implementation — Phase 2 (future agents)
+## Adding a new specialist domain
 
-Each new specialist follows the same registration pattern:
+With the unified agent, adding a new domain (e.g. hydration analysis, stress trends) means:
 
-```
-1. Define output model in src/models/
-2. Create src/agents/<name>_agent.py following CLAUDE.md agent structure
-3. In orchestrator.py:
-   a. Add import
-   b. Add @orchestrator.tool function with clear docstring
-   c. Add one bullet to SYSTEM_PROMPT describing when to use it
-```
-
-### Planned specialists
-
-| Agent | Domain | Key inputs |
-|-------|--------|------------|
-| `hydration_agent` | Daily hydration targets | Weather, session duration, body weight |
-| `stress_agent` | HRV/stress trend analysis | HRV history, body battery, sleep quality |
-| `training_theory_agent` | Periodization, load planning | Weekly volume, fitness trends, race date |
+1. Add a new aggregation method to `StarkDatabase` in `connection.py`
+2. Add a new `@agent.tool` in `jarvis_agent.py` that calls it
+3. Add one bullet to the relevant "lens" in the system prompt, or add a fourth lens
+4. No new agent file, no new port, no new LLM call
 
 ---
 
-## Open questions / future decisions
+## Open decisions
 
-- **Conversation memory**: Should the orchestrator remember previous sessions, or start
-  fresh each time? (Currently: fresh each time, history within one session only.)
-- **Data staleness detection**: Should the orchestrator warn the user when the last
-  extraction was more than N days ago? (Low priority, manual pipeline is acceptable for now.)
-- **Parallel specialist calls**: For multi-domain queries, call specialists concurrently
-  (`asyncio.gather`) to reduce latency. Implement once there are 3+ specialists being
-  called simultaneously.
+- **Conversation memory across sessions:** Currently history lives in-process in
+  `fastapi_app.py` per session cookie. Cleared on server restart.
+- **Data staleness warning:** No mechanism yet to warn the user when last extraction was
+  >N days ago. Could be a check inside `get_readiness_snapshot`.
+- **Structured output:** `jarvis_agent` returns `str`. If the dashboard ever needs to
+  render specific fields (e.g. highlight a risk label), wrap output in a thin Pydantic
+  model at that point.
