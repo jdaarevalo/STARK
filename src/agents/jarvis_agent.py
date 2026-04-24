@@ -141,7 +141,7 @@ def get_recent_runs(limit: int = 5) -> list:
     db = StarkDatabase()
     config = load_athlete_config()
     lthr = int(config.get("lthr", 0)) or None
-    return db.get_biomechanics_snapshot(lthr=lthr)
+    return db.get_biomechanics_snapshot(limit=limit, lthr=lthr)
 
 
 @agent.tool_plain

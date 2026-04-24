@@ -146,6 +146,52 @@ def extract_race_predictions(client) -> None:
         logger.error(f"Error extracting race predictions: {e}")
 
 
+def extract_lactate_threshold(client) -> None:
+    """Fetches Garmin's latest device-estimated LTHR and updates athlete_config.json.
+
+    Only writes if a valid bpm value is found and it differs from the stored value.
+    Non-fatal: logs a warning and returns if Garmin has no estimate yet.
+    """
+    logger.info("Extracting lactate threshold data from Garmin...")
+    try:
+        data = client.get_lactate_threshold(latest=True)
+
+        entry = data[0] if isinstance(data, list) else (data or {})
+
+        # Garmin may nest the value differently depending on device/firmware
+        lthr_bpm = (
+            entry.get("heartRateIntervalBpm")
+            or entry.get("lactateThresholdHeartRate")
+            or ((entry.get("heartRate") or {}).get("value"))
+        )
+
+        if not lthr_bpm or not isinstance(lthr_bpm, (int, float)):
+            logger.warning(f"No valid LTHR bpm found in Garmin response: {entry}")
+            return
+
+        lthr_bpm = int(lthr_bpm)
+
+        config_path = PROJECT_ROOT / "data" / "athlete_config.json"
+        config: dict = {}
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+
+        current = config.get("lthr", 0)
+        if current == lthr_bpm:
+            logger.info(f"LTHR unchanged at {lthr_bpm} bpm — skipping update.")
+            return
+
+        config["lthr"] = lthr_bpm
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=4)
+        logger.info(f"LTHR updated: {current} → {lthr_bpm} bpm (athlete_config.json)")
+
+    except Exception as e:
+        logger.error(f"Error extracting lactate threshold: {e}")
+
+
 def extract_hydration(client, target_date) -> None:
     """Extracts daily hydration intake from Garmin Connect."""
     date_str = target_date.isoformat()
@@ -258,6 +304,7 @@ def run_full_extraction() -> None:
     extract_training_plan(client)
     extract_race_predictions(client)
     extract_weight_history(client, days=30)
+    extract_lactate_threshold(client)
     logger.info("Extraction pipeline finished.")
 
 

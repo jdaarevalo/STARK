@@ -22,7 +22,7 @@ setup_logging()
 
 import logfire
 
-logfire.configure()
+logfire.configure(service_name="stark-jarvis")
 logfire.instrument_pydantic_ai()
 
 import asyncio

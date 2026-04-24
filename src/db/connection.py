@@ -698,14 +698,14 @@ class StarkDatabase:
             "tss_today": round(float(latest["tss"]), 1),
         }
 
-    def get_biomechanics_snapshot(self, lthr: Optional[int] = None) -> list:
+    def get_biomechanics_snapshot(self, limit: int = 3, lthr: Optional[int] = None) -> list:
         """
         Condensed biomechanics summary for the J.A.R.V.I.S. unified agent.
-        Returns last 3 runs with pre-computed drift fields and human-readable
+        Returns last N runs with pre-computed drift fields and human-readable
         flag labels — no raw row data that forces the LLM to do arithmetic.
         """
         from src.models.biometrics import format_pace
-        rows = self.get_run_biomechanics(limit=3, lthr=lthr)
+        rows = self.get_run_biomechanics(limit=limit, lthr=lthr)
         if not rows:
             return []
 
