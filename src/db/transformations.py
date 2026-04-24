@@ -193,6 +193,45 @@ def process_fit_files():
         logger.info(f"Run telemetry saved with {len(df)} rows to {output_path}")
 
 
+def process_weight_jsons():
+    """Reads weight_history_*.json files and saves a consolidated Silver Parquet."""
+    logger.info("Starting weight history processing...")
+    files = sorted(glob.glob(str(RAW_DIR / "weight_history_*.json")), reverse=True)
+    if not files:
+        logger.warning("No weight history files found in raw.")
+        return
+
+    # Use only the most recent file — it already covers the full 30-day window
+    with open(files[0], "r") as f:
+        data = json.load(f)
+
+    summaries = data.get("dailyWeightSummaries") or []
+    records = []
+    for entry in summaries:
+        latest = entry.get("latestWeight") or {}
+        weight_g = latest.get("weight")
+        records.append({
+            "date": entry.get("summaryDate"),
+            "weight_kg": round(weight_g / 1000, 2) if weight_g else None,
+            "bmi": latest.get("bmi"),
+            "body_fat_pct": latest.get("bodyFat"),
+            "muscle_mass_kg": round(latest.get("muscleMass") / 1000, 2) if latest.get("muscleMass") else None,
+            "source_type": latest.get("sourceType"),
+        })
+
+    if not records:
+        logger.warning("No weight entries to process.")
+        return
+
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+
+    output_path = PROCESSED_DIR / "silver_weight.parquet"
+    df.to_parquet(output_path, index=False)
+    logger.info(f"Saved {len(df)} weight records to {output_path}")
+
+
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -202,5 +241,6 @@ if __name__ == "__main__":
     process_sleep_jsons()
     process_health_telemetry_jsons()
     process_hydration_jsons()
+    process_weight_jsons()
     process_fit_files()
     logger.info("Bronze -> Silver processing complete.")

@@ -24,9 +24,10 @@ src/
                              # Also exports: load/save_athlete_config, load/save_daily_input
   models/biometrics.py       # DailyReadiness, RunSummary, AthleteContext, ShoeEntry, BiomechanicsReport
   models/workouts.py         # DailyActionPlan, WorkoutInterval
-  agents/jarvis_agent.py     # J.A.R.V.I.S. unified agent — PRIMARY entry point, 1 LLM call
-                             # Tools: get_readiness_snapshot, get_training_load_snapshot,
-                             #        get_biomechanics_snapshot, get_athlete_profile
+  agents/jarvis_agent.py     # J.A.R.V.I.S. unified agent — PRIMARY entry point
+                             # Hybrid: injects recovery+profile snapshot, exposes 4 tools:
+                             #   get_training_load, get_recent_runs, get_health_trend,
+                             #   query_athlete_data (SELECT-only SQL against gold views)
   agents/orchestrator.py     # Legacy orchestrator (3-LLM chain) — kept, not used by fastapi_app
   agents/planner_agent.py    # Training planner specialist — port 7932
   agents/biomechanics_agent.py  # Biomechanics specialist — port 7933
@@ -106,12 +107,18 @@ Raw files written by `src/extractors/garmin.py`:
 - `sleep_data_YYYY-MM-DD.json`
 - `health_telemetry_YYYY-MM-DD.json`
 - `run_YYYY-MM-DD_<activity_id>.zip`
+- `hydration_YYYY-MM-DD.json` — re-extracted for last 7 days on every sync
+- `weight_history_YYYY-MM-DD.json` — 30-day weigh-in range, re-extracted on every sync
+- `training_plan_YYYY-MM-DD.json` — active Garmin Coach adaptive plan, re-extracted on every sync
+- `race_predictions_YYYY-MM-DD.json` — Garmin 5K/10K/HM/marathon estimates, re-extracted on every sync
 
 ### Silver (`data/processed/`)
 Parquet files written by `src/db/transformations.py`:
 - `silver_sleep_data.parquet` — all dates consolidated in one file
 - `silver_health_telemetry.parquet` — all dates consolidated in one file
 - `silver_run_<activity_id>.parquet` — one file per activity
+- `silver_hydration.parquet` — all dates consolidated in one file
+- `silver_weight.parquet` — all weigh-in entries consolidated in one file
 
 When parsing Garmin JSON, always use `data.get("key") or {}` (not just `data.get("key", {})`) to guard against explicit `None` values returned by the API.
 
@@ -122,6 +129,12 @@ DuckDB views in `StarkDatabase._setup_views()`:
 - `gold_sleep` → `silver_sleep_data.parquet`
 - `gold_health` → `silver_health_telemetry.parquet`
 - `gold_runs` → `silver_run_*.parquet` with `union_by_name=true`
+- `gold_hydration` → `silver_hydration.parquet` (created only if file exists)
+- `gold_weight` → `silver_weight.parquet` (created only if file exists)
+
+Non-time-series data (race predictions, training plan) is loaded directly from the most
+recent raw JSON via `load_race_predictions()` and `load_training_plan()` — no DuckDB view
+needed since they are not queried with SQL.
 
 `StarkDatabase` is a singleton. Reset `StarkDatabase._instance = None` in tests.
 
@@ -162,11 +175,71 @@ date: date
 ### Primary agent — `jarvis_agent.py`
 
 `src/agents/jarvis_agent.py` is the single active entry point used by `fastapi_app.py`.
-It is a unified agent (1 LLM call per user message) backed by aggregation tools in
-`connection.py`. **Do not add new sub-agent chains** — add aggregation methods to
-`StarkDatabase` and new `@agent.tool` functions in `jarvis_agent.py` instead.
+It uses a **hybrid architecture**: a lightweight context snapshot is always injected, and
+deeper data is fetched on-demand via tools. **Do not add new sub-agent chains** — add
+aggregation methods to `StarkDatabase` and expose them as `@agent.tool_plain` functions
+in `jarvis_agent.py` instead.
 
 `orchestrator.py` is the legacy 3-LLM routing chain. It is kept but not used by the chat UI.
+
+### Hybrid context architecture
+
+Every request injects a lightweight snapshot (~400 tokens) containing only the data needed
+to answer *any* question without extra round-trips:
+
+| Always injected | Rationale |
+|---|---|
+| `recovery` — HRV, RHR, Body Battery, sleep score + 7d deltas, soreness | Needed for all session recommendations |
+| `athlete_profile` — goal, LTHR, target pace, days to race, shoe status | Needed for all planning and pacing advice |
+| `weight` — latest kg + 30d delta | Lightweight, used by nutrition lens |
+| `garmin_coach_today_tomorrow` — today's and tomorrow's Garmin Coach workouts | Needed for daily session recommendations |
+| `garmin_race_predictions` — 5K/10K/HM/marathon Garmin estimates | Static reference, near-zero tokens |
+
+Everything else lives behind a tool and is fetched only when the user's question requires it.
+
+### Deciding where a new metric belongs
+
+When you add a new data source, apply this test before writing code:
+
+**Put it in the injected context if ALL of the following are true:**
+1. It's needed to answer the most common daily questions ("should I run?", "how am I recovering?")
+2. It's a single scalar or a small flat dict (not a list of rows)
+3. It changes every day and is always relevant regardless of what the user asks
+4. Adding it costs fewer than ~100 tokens
+
+**Expose it as a tool otherwise** — especially if:
+- It's a list of records (runs, trend rows, time-series)
+- It's only relevant for specific question types
+- It's expensive to compute (requires a heavy DuckDB aggregation)
+- The user has to ask a specific question for it to matter
+
+**Practical examples:**
+
+| Metric | Where | Why |
+|---|---|---|
+| Today's HRV + 7d delta | Context | Single scalar, needed for every session recommendation |
+| Last 3 runs biomechanics | Tool (`get_recent_runs`) | List of rows, only needed for run-specific questions |
+| ATL/CTL/TSB | Tool (`get_training_load`) | Heavy aggregation, only needed for load/planning questions |
+| 30-day HRV trend | Tool (`get_health_trend`) | Time-series, only needed for trend questions |
+| Morning vs evening HR | Tool (`query_athlete_data`) | Ad-hoc SQL, narrow use case |
+| Latest weight + 30d delta | Context | Two scalars, relevant to nutrition lens |
+| Full weight history | Tool (`query_athlete_data`) | List of rows, only for trend questions |
+| Today/tomorrow Garmin Coach workouts | Context | 1-2 items, needed for every session recommendation |
+| Full Garmin Coach week | Tool (`get_upcoming_workouts`) | List of items, only for weekly planning questions |
+| Race predictions (5K/10K/HM/Marathon) | Context | 4 scalars, static reference for all pacing advice |
+
+### Available tools in `jarvis_agent.py`
+
+| Tool | Returns | Use for |
+|---|---|---|
+| `get_training_load()` | ATL/CTL/TSB snapshot dict | Load/fatigue/injury-risk questions, session planning |
+| `get_recent_runs(limit)` | List of N runs with full biomechanics | Last session, run history, post-run nutrition |
+| `get_health_trend(days)` | Daily HRV/sleep/RHR rows | Multi-day recovery trend questions |
+| `get_upcoming_workouts()` | Full Garmin Coach week schedule | Full week plan, sessions beyond tomorrow |
+| `query_athlete_data(sql)` | Up to 100 rows from gold views | Any ad-hoc question not covered above |
+
+`query_athlete_data` accepts SELECT-only SQL. The gold view schema is documented in
+`_GOLD_SCHEMA` at the top of `jarvis_agent.py` and embedded in the system prompt.
 
 ### Output models always live in `src/models/`
 

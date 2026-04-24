@@ -105,7 +105,18 @@ class StarkDatabase:
                 SELECT * FROM read_parquet('{hydration_parquet}')
             """)
 
+        weight_parquet = PROCESSED_DIR / "silver_weight.parquet"
+        if weight_parquet.exists():
+            self.conn.execute(f"""
+                CREATE OR REPLACE VIEW gold_weight AS
+                SELECT * FROM read_parquet('{weight_parquet}')
+            """)
+
         logger.info("Gold layer views ready.")
+
+    def refresh_views(self) -> None:
+        """Re-runs _setup_views() so the glob re-discovers any parquet files written since startup."""
+        self._setup_views()
 
     def get_run_summary(self, activity_id: str) -> Optional[Dict[str, Any]]:
         """Returns aggregated metrics for a single run activity."""
@@ -730,6 +741,45 @@ class StarkDatabase:
             })
         return result
 
+    def get_weight_snapshot(self, days: int = 30) -> dict:
+        """
+        Returns weight trend for the last N days for the J.A.R.V.I.S. agent.
+        Includes latest weight, 30d delta, and all entries for trend analysis.
+        """
+        try:
+            since = (date.today() - timedelta(days=days)).isoformat()
+            result = self.conn.execute(f"""
+                SELECT
+                    CAST(date AS DATE) AS date,
+                    weight_kg,
+                    bmi,
+                    body_fat_pct,
+                    muscle_mass_kg
+                FROM gold_weight
+                WHERE CAST(date AS DATE) >= CAST('{since}' AS DATE)
+                  AND weight_kg IS NOT NULL
+                ORDER BY date ASC
+            """).df()
+
+            if result.empty:
+                return {"status": "no_data"}
+
+            rows = result.to_dict(orient="records")
+            latest = rows[-1]
+            delta = round(latest["weight_kg"] - rows[0]["weight_kg"], 2) if len(rows) > 1 else None
+            return {
+                "latest_kg": latest["weight_kg"],
+                "latest_date": str(latest["date"])[:10],
+                "delta_kg_over_period": delta,
+                "entries": [
+                    {"date": str(r["date"])[:10], "weight_kg": r["weight_kg"]}
+                    for r in rows
+                ],
+            }
+        except Exception as e:
+            logger.error(f"Failed to retrieve weight snapshot: {e}")
+            return {"status": "no_data"}
+
     def close(self) -> None:
         """Shuts down the Arc Reactor safely."""
         self.conn.close()
@@ -755,6 +805,99 @@ def save_athlete_config(config: dict) -> None:
     _ATHLETE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     _ATHLETE_CONFIG_PATH.write_text(json.dumps(config, indent=2, default=str))
     logger.info("Athlete config saved.")
+
+
+def _seconds_to_hms(seconds: Optional[int]) -> Optional[str]:
+    if not seconds:
+        return None
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def load_training_plan() -> dict:
+    """
+    Loads the most recent Garmin Coach training plan JSON from data/raw/.
+    Returns two things:
+      - 'today_tomorrow': list of workouts scheduled for today and tomorrow (for context injection)
+      - 'week': full list of all upcoming workouts (for the get_upcoming_workouts tool)
+    Returns {} if no file exists yet.
+    """
+    raw_dir = PROJECT_ROOT / "data" / "raw"
+    files = sorted(raw_dir.glob("training_plan_*.json"), reverse=True)
+    if not files:
+        return {}
+    try:
+        data = json.loads(files[0].read_text())
+        tasks = data.get("taskList") or []
+        today_dt = date.today()
+        tomorrow_dt = today_dt + timedelta(days=1)
+
+        def _parse_task(t: dict) -> Optional[dict]:
+            w = t.get("taskWorkout") or {}
+            if w.get("restDay"):
+                return None
+            cal_date = t.get("calendarDate") or (w.get("scheduledDate") or "")[:10]
+            if not cal_date:
+                return None
+            return {
+                "date": cal_date,
+                "name": w.get("workoutName"),
+                "description": w.get("workoutDescription"),
+                "duration_min": round((w.get("estimatedDurationInSecs") or 0) / 60),
+                "type": w.get("trainingEffectLabel"),
+                "sport": (w.get("sportType") or {}).get("sportTypeKey"),
+                "status": w.get("adaptiveCoachingWorkoutStatus"),
+                "priority": w.get("priorityType"),
+            }
+
+        week_workouts = []
+        today_tomorrow = []
+        for t in tasks:
+            parsed = _parse_task(t)
+            if not parsed:
+                continue
+            week_workouts.append(parsed)
+            if parsed["date"] in (today_dt.isoformat(), tomorrow_dt.isoformat()):
+                today_tomorrow.append(parsed)
+
+        week_workouts.sort(key=lambda x: x["date"])
+        today_tomorrow.sort(key=lambda x: x["date"])
+
+        return {
+            "plan_name": data.get("name"),
+            "plan_end_date": (data.get("endDate") or "")[:10],
+            "today_tomorrow": today_tomorrow,
+            "week": week_workouts,
+        }
+    except Exception as e:
+        logger.error(f"Failed to load training plan: {e}")
+        return {}
+
+
+def load_race_predictions() -> dict:
+    """
+    Loads the most recent Garmin race prediction JSON from data/raw/.
+    Returns a dict with formatted times for 5K, 10K, half marathon, and marathon,
+    plus the raw seconds so J.A.R.V.I.S. can compare against target pace.
+    Returns {} if no file exists yet.
+    """
+    raw_dir = PROJECT_ROOT / "data" / "raw"
+    files = sorted(raw_dir.glob("race_predictions_*.json"), reverse=True)
+    if not files:
+        return {}
+    try:
+        data = json.loads(files[0].read_text())
+        return {
+            "as_of_date": data.get("calendarDate"),
+            "5k":            {"seconds": data.get("time5K"),            "formatted": _seconds_to_hms(data.get("time5K"))},
+            "10k":           {"seconds": data.get("time10K"),           "formatted": _seconds_to_hms(data.get("time10K"))},
+            "half_marathon": {"seconds": data.get("timeHalfMarathon"),  "formatted": _seconds_to_hms(data.get("timeHalfMarathon"))},
+            "marathon":      {"seconds": data.get("timeMarathon"),      "formatted": _seconds_to_hms(data.get("timeMarathon"))},
+        }
+    except Exception as e:
+        logger.error(f"Failed to load race predictions: {e}")
+        return {}
 
 
 def load_daily_inputs() -> dict:

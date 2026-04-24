@@ -4,8 +4,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from src.config.logging_config import setup_logging
 setup_logging()
+
+import logfire
+
+logfire.configure()
+logfire.instrument_pydantic_ai()
 
 import datetime
 import logging
@@ -19,6 +27,7 @@ from src.db.connection import (
     StarkDatabase,
     load_athlete_config,
     load_daily_inputs,
+    load_race_predictions,
     save_athlete_config,
     save_daily_input,
 )
@@ -27,6 +36,7 @@ from src.db.transformations import (
     process_health_telemetry_jsons,
     process_hydration_jsons,
     process_sleep_jsons,
+    process_weight_jsons,
 )
 from src.extractors.garmin import run_full_extraction
 
@@ -115,6 +125,13 @@ _TOOLTIPS = {
         "- **Yellow (FAIR)** — 50–69. Partial recovery; consider adjusting load.\n"
         "- **Red (POOR)** — <50. Prioritise sleep over training intensity.\n\n"
         "The dotted line marks the 70-point 'good' threshold."
+    ),
+    "weight": (
+        "**Weight — 30-day Trend**\n\n"
+        "Body weight logged in Garmin Connect. The dotted line is a linear trend.\n\n"
+        "For half marathon performance, gradual weight reduction improves running economy "
+        "(roughly 1% faster per kg lost). The trend matters more than daily fluctuations, "
+        "which can vary ±1 kg from hydration alone."
     ),
     "hydration": (
         "**Hydration — 30-day Trend**\n\n"
@@ -213,6 +230,24 @@ def load_efficiency_trend(weeks: int = 16, lthr: int = 0) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def load_weight(days: int = 30) -> pd.DataFrame:
+    try:
+        result = get_db().conn.execute(f"""
+            SELECT CAST(date AS DATE) AS date, weight_kg
+            FROM gold_weight
+            WHERE CAST(date AS DATE) >= CAST('{(datetime.date.today() - datetime.timedelta(days=days)).isoformat()}' AS DATE)
+              AND weight_kg IS NOT NULL
+            ORDER BY date ASC
+        """).df()
+        if result.empty:
+            return pd.DataFrame()
+        result["date"] = pd.to_datetime(result["date"])
+        return result
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def load_hydration(days: int = 30) -> pd.DataFrame:
     rows = get_db().get_hydration_trend(days)
     if not rows:
@@ -220,6 +255,11 @@ def load_hydration(days: int = 30) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_race_predictions() -> dict:
+    return load_race_predictions()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -389,7 +429,10 @@ def render_sidebar(health_df: pd.DataFrame) -> None:
             process_hydration_jsons()
             st.write("Processing .FIT files...")
             process_fit_files()
+            st.write("Processing weight data...")
+            process_weight_jsons()
             status.update(label="Sync complete!", state="complete")
+        get_db().refresh_views()
         st.cache_data.clear()
         st.rerun()
 
@@ -759,6 +802,36 @@ def chart_hydration(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def chart_weight(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=df["weight_kg"],
+        mode="lines+markers",
+        line=dict(color="#a78bfa", width=2),
+        marker=dict(size=7),
+        hovertemplate="%{x|%b %d}: <b>%{y:.1f} kg</b><extra></extra>",
+    ))
+    if len(df) >= 2:
+        import numpy as np
+        x_num = (df["date"] - df["date"].min()).dt.days.values
+        coeffs = np.polyfit(x_num, df["weight_kg"].values, 1)
+        trend_y = np.polyval(coeffs, x_num)
+        fig.add_trace(go.Scatter(
+            x=df["date"], y=trend_y,
+            mode="lines", name="Trend",
+            line=dict(color="#f472b6", width=1.5, dash="dot"),
+            hoverinfo="skip",
+        ))
+    fig.update_layout(
+        title="Weight (kg)",
+        xaxis=dict(tickformat="%b %d"),
+        yaxis=dict(title="kg"),
+        margin=dict(t=50, b=30, l=55, r=20),
+        height=300, showlegend=False,
+    )
+    return fig
+
+
 # ── Dashboard tab ──────────────────────────────────────────────────────────────
 
 def _render_race_countdown(athlete_config: dict) -> None:
@@ -808,6 +881,37 @@ def _render_race_countdown(athlete_config: dict) -> None:
             st.progress(pct, text=f":{color}[{km_used:.0f} / {max_km} km]")
         col_idx += 1
 
+    # ── Garmin race predictions ───────────────────────────────────────────────
+    predictions = get_race_predictions()
+    if predictions:
+        st.markdown("**Garmin Race Predictions**")
+        p_cols = st.columns(4)
+        distances = [
+            ("5K",            predictions.get("5k", {}),            None),
+            ("10K",           predictions.get("10k", {}),           None),
+            ("Half Marathon", predictions.get("half_marathon", {}), target_pace),
+            ("Marathon",      predictions.get("marathon", {}),      None),
+        ]
+        for col, (label, pred, t_pace) in zip(p_cols, distances):
+            formatted = pred.get("formatted", "—")
+            delta_str = None
+            delta_color = "off"
+            if label == "Half Marathon" and t_pace:
+                target_sec = round(t_pace * 60 * 21.0975)
+                pred_sec = pred.get("seconds") or 0
+                if pred_sec:
+                    diff = pred_sec - target_sec
+                    abs_diff = abs(diff)
+                    sign = "+" if diff > 0 else "-"
+                    diff_str = f"{abs_diff // 60}:{abs_diff % 60:02d}"
+                    delta_str = f"{sign}{diff_str} vs target"
+                    delta_color = "normal"
+            col.metric(label, formatted, delta=delta_str,
+                       delta_color=delta_color if delta_str else "off")
+        as_of = predictions.get("as_of_date", "")
+        if as_of:
+            st.caption(f"As of {as_of} · Updated on each Sync")
+
     st.divider()
 
 
@@ -818,6 +922,7 @@ def render_dashboard(
     load_df: pd.DataFrame,
     efficiency_df: pd.DataFrame,
     hydration_df: pd.DataFrame,
+    weight_df: pd.DataFrame,
     athlete_config: dict,
 ) -> None:
     if runs_df.empty and health_df.empty:
@@ -880,7 +985,7 @@ def render_dashboard(
     else:
         st.warning("No HRV / Body Battery data.")
 
-    h_col3, h_col4, h_col5 = st.columns(3)
+    h_col3, h_col4, h_col5, h_col6 = st.columns(4)
     with h_col3:
         _section_header("Resting Heart Rate", "resting_hr")
         if not health_df.empty:
@@ -908,6 +1013,20 @@ def render_dashboard(
             )
         else:
             st.info("No hydration data. Sync to pull from Garmin.")
+    with h_col6:
+        _section_header("Weight", "weight")
+        if not weight_df.empty:
+            st.plotly_chart(chart_weight(weight_df), use_container_width=True)
+            latest_w = weight_df.iloc[-1]
+            delta_kg = round(latest_w["weight_kg"] - weight_df.iloc[0]["weight_kg"], 2) if len(weight_df) > 1 else None
+            delta_str = ""
+            if delta_kg is not None:
+                sign = "+" if delta_kg > 0 else ""
+                color = "red" if delta_kg > 0 else "green"
+                delta_str = f" (:{color}[{sign}{delta_kg} kg over 30d])"
+            st.markdown(f"Latest: **{latest_w['weight_kg']:.1f} kg**{delta_str}")
+        else:
+            st.info("No weight data. Log weight in Garmin Connect.")
 
 
 # ── Chat tab ───────────────────────────────────────────────────────────────────
@@ -924,6 +1043,7 @@ def render_chat() -> None:
 runs_df = load_runs(20)
 health_df = load_health(30)
 hydration_df = load_hydration(30)
+weight_df = load_weight(30)
 
 render_sidebar(health_df)
 
@@ -934,6 +1054,6 @@ with tab_dash:
     intensity_df = load_weekly_intensity(2, lthr=lthr)
     efficiency_df = load_efficiency_trend(16, lthr=lthr)
     load_df = load_training_load(lthr) if lthr > 0 else pd.DataFrame()
-    render_dashboard(runs_df, health_df, intensity_df, load_df, efficiency_df, hydration_df, athlete_config)
+    render_dashboard(runs_df, health_df, intensity_df, load_df, efficiency_df, hydration_df, weight_df, athlete_config)
 with tab_chat:
     render_chat()

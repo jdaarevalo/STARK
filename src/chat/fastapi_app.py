@@ -13,10 +13,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from src.config.logging_config import setup_logging
 
 setup_logging()
 
+import logfire
+
+logfire.configure()
+logfire.instrument_pydantic_ai()
+
+import asyncio
 import json
 import logging
 import uuid
@@ -26,7 +35,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from src.agents.jarvis_agent import agent as orchestrator, build_context
+from src.agents.jarvis_agent import agent as orchestrator, build_context_with_steps
 
 logger = logging.getLogger("src.chat.fastapi_app")
 
@@ -150,6 +159,62 @@ _HTML = """<!DOCTYPE html>
   #send-btn:disabled { background: #1e3a5f; color: #475569; cursor: not-allowed; }
 
   .thinking { color: #475569; font-style: italic; font-size: 0.8rem; }
+
+  .think-panel {
+    align-self: flex-start;
+    max-width: 78%;
+    background: #0d1117;
+    border: 1px solid #1e2433;
+    border-radius: 10px;
+    overflow: hidden;
+    font-size: 0.78rem;
+  }
+  .think-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    user-select: none;
+    color: #64748b;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.2s;
+  }
+  .think-header.open { border-color: #1e2433; }
+  .think-header .spinner {
+    width: 10px; height: 10px;
+    border: 2px solid #3b82f6;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  .think-header .spinner.done {
+    border-color: #22c55e;
+    border-top-color: #22c55e;
+    animation: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .think-header .label { font-weight: 500; color: #94a3b8; }
+  .think-header .chevron { margin-left: auto; transition: transform 0.2s; }
+  .think-header.open .chevron { transform: rotate(180deg); }
+
+  .think-steps {
+    display: none;
+    padding: 6px 12px 10px;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .think-steps.open { display: flex; }
+  .think-step {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    color: #475569;
+  }
+  .think-step .icon { color: #3b82f6; flex-shrink: 0; }
+  .think-step .step-label { color: #94a3b8; }
+  .think-step .step-detail { color: #475569; font-size: 0.72rem; }
 </style>
 </head>
 <body>
@@ -193,7 +258,43 @@ async function sendMessage() {
 
   addMsg("user", text);
 
-  const assistantEl = addMsg("assistant thinking", "…");
+  // Thinking panel
+  const thinkPanel = document.createElement("div");
+  thinkPanel.className = "think-panel";
+  thinkPanel.innerHTML = `
+    <div class="think-header open" id="think-hdr">
+      <div class="spinner" id="think-spinner"></div>
+      <span class="label" id="think-label">Loading telemetry…</span>
+      <span class="chevron">▾</span>
+    </div>
+    <div class="think-steps open" id="think-steps"></div>
+  `;
+  messagesEl.appendChild(thinkPanel);
+  scrollBottom();
+
+  const thinkHdr    = thinkPanel.querySelector("#think-hdr");
+  const thinkLabel  = thinkPanel.querySelector("#think-label");
+  const thinkSteps  = thinkPanel.querySelector("#think-steps");
+  const thinkSpinner = thinkPanel.querySelector("#think-spinner");
+  thinkHdr.addEventListener("click", () => {
+    thinkHdr.classList.toggle("open");
+    thinkSteps.classList.toggle("open");
+  });
+
+  const assistantEl = document.createElement("div");
+  assistantEl.className = "msg assistant";
+  assistantEl.style.display = "none";
+  messagesEl.appendChild(assistantEl);
+
+  function addStep(label, detail) {
+    const row = document.createElement("div");
+    row.className = "think-step";
+    row.innerHTML = `<span class="icon">⚡</span><span class="step-label">${label}</span>`
+      + (detail ? `<span class="step-detail">— ${detail}</span>` : "");
+    thinkSteps.appendChild(row);
+    thinkLabel.textContent = label;
+    scrollBottom();
+  }
 
   try {
     const response = await fetch("/chat", {
@@ -203,6 +304,8 @@ async function sendMessage() {
     });
 
     if (!response.ok) {
+      thinkPanel.remove();
+      assistantEl.style.display = "";
       assistantEl.textContent = "Error: " + response.statusText;
       assistantEl.className = "msg assistant error";
       return;
@@ -212,7 +315,7 @@ async function sendMessage() {
     const decoder = new TextDecoder();
     let buffer = "";
     let fullText = "";
-    let firstChunk = true;
+    let responding = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -227,21 +330,31 @@ async function sendMessage() {
         const payload = line.slice(6);
         if (payload === "[DONE]") break;
         try {
-          const { delta } = JSON.parse(payload);
-          if (firstChunk) {
-            assistantEl.textContent = "";
-            assistantEl.className = "msg assistant";
-            firstChunk = false;
+          const msg = JSON.parse(payload);
+          if (msg.step !== undefined) {
+            addStep(msg.step, msg.detail);
+          } else if (msg.status === "thinking") {
+            // heartbeat — panel already visible, nothing to do
+          } else if (msg.delta !== undefined) {
+            if (!responding) {
+              // Collapse and dim the think panel, show response
+              thinkHdr.classList.remove("open");
+              thinkSteps.classList.remove("open");
+              thinkSpinner.classList.add("done");
+              thinkLabel.textContent = "Context loaded";
+              assistantEl.style.display = "";
+              responding = true;
+            }
+            fullText += msg.delta;
+            assistantEl.textContent = fullText;
+            scrollBottom();
           }
-          fullText += delta;
-          assistantEl.textContent = fullText;
-          scrollBottom();
         } catch (_) {}
       }
     }
 
-    if (firstChunk) {
-      assistantEl.className = "msg assistant";
+    if (!responding) {
+      assistantEl.style.display = "";
       assistantEl.textContent = fullText || "(no response)";
     }
 
@@ -294,11 +407,34 @@ async def chat(request: Request):
     logger.info("session=%s | user: %s", session_id, user_message[:80])
 
     async def event_stream():
+        is_first_message = len(history) == 0
+
+        if is_first_message:
+            # Load and stream telemetry steps only on the first turn
+            ctx_json = ""
+            for label, detail in build_context_with_steps():
+                if label == "__context__":
+                    ctx_json = detail
+                else:
+                    yield "data: " + json.dumps({"step": label, "detail": detail}) + "\n\n"
+            prompt = f"[DATA CONTEXT]\n{ctx_json}\n[END DATA CONTEXT]\n\n{user_message}"
+        else:
+            prompt = user_message
+
+        yield "data: " + json.dumps({"step": "Consulting J.A.R.V.I.S.…", "detail": None}) + "\n\n"
         try:
-            ctx = build_context()
-            result = await orchestrator.run(ctx + user_message, message_history=history)
+            coro = orchestrator.run(
+                prompt,
+                message_history=history,
+            )
+            task = asyncio.ensure_future(coro)
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=3)
+                if done:
+                    break
+                yield "data: " + json.dumps({"status": "thinking"}) + "\n\n"
+            result = task.result()
             text: str = result.output or ""
-            # Stream the completed text in small chunks so the UI feels responsive
             chunk_size = 12
             for i in range(0, len(text), chunk_size):
                 yield "data: " + json.dumps({"delta": text[i:i + chunk_size]}) + "\n\n"

@@ -28,19 +28,24 @@ Garmin API / .FIT files
   FastAPI SSE chat (port 7934) + Streamlit dashboard (port 8501)
 ```
 
-### Agent design — single LLM call
+### Agent design — hybrid context injection + on-demand tools
 
-J.A.R.V.I.S. is a single pydantic-ai agent with four DuckDB-backed tools that return pre-aggregated snapshots. There are no sub-agent chains. One user message = one LLM call.
+J.A.R.V.I.S. injects a lightweight snapshot (~400 tokens) on the first message, then fetches deeper data via tools only when the question requires it.
 
 ```
-User message
+First message only:
+  inject → recovery snapshot + athlete profile + weight + today/tomorrow workouts + race predictions
+
+Every message:
     │
     ▼
 jarvis_agent  (1 LLM call)
-    ├── get_readiness_snapshot()      HRV / RHR / Body Battery / Sleep + 7d deltas
-    ├── get_training_load_snapshot()  ATL / CTL / TSB / ACR ratio + risk label
-    ├── get_biomechanics_snapshot()   Last 3 runs: cadence, GCT, VO, VR, drift
-    └── get_athlete_profile()         Race date, target pace, shoe mileage
+    ├── [context] recovery, profile, weight, garmin_coach_today_tomorrow, race_predictions
+    ├── get_training_load()        → ATL/CTL/TSB, ACR, injury risk (on demand)
+    ├── get_recent_runs(n)         → last N runs with biomechanics (on demand)
+    ├── get_health_trend(days)     → multi-day HRV/sleep/RHR trend (on demand)
+    ├── get_upcoming_workouts()    → full Garmin Coach week schedule (on demand)
+    └── query_athlete_data(sql)    → ad-hoc SELECT against gold views (on demand)
     │
     ▼
 Synthesized response (plain text, J.A.R.V.I.S. tone)
@@ -194,6 +199,10 @@ uv run python src/db/transformations.py
 | `sleep_data_YYYY-MM-DD.json` | Raw sleep session from Garmin API |
 | `health_telemetry_YYYY-MM-DD.json` | HRV, body battery, stress, VO2 Max, steps |
 | `run_YYYY-MM-DD_<id>.zip` | Original `.FIT` binary (second-by-second telemetry) |
+| `hydration_YYYY-MM-DD.json` | Daily water intake from Garmin Connect |
+| `weight_history_YYYY-MM-DD.json` | 30-day weigh-in history |
+| `training_plan_YYYY-MM-DD.json` | Active Garmin Coach adaptive plan (full task list) |
+| `race_predictions_YYYY-MM-DD.json` | Garmin's 5K / 10K / HM / marathon time estimates |
 
 ### Silver (`data/processed/`)
 
@@ -203,6 +212,7 @@ uv run python src/db/transformations.py
 | `silver_health_telemetry.parquet` | `date`, `resting_heart_rate`, `hrv_last_night_avg`, `hrv_status`, `body_battery_end`, `vo2_max` |
 | `silver_run_<id>.parquet` | `timestamp`, `distance`, `heart_rate`, `cadence`, `power`, `enhanced_speed`, `vertical_oscillation`, `vertical_ratio`, `stance_time`, `step_length` |
 | `silver_hydration.parquet` | `date`, `intake_ml`, `goal_ml`, `sweat_loss_ml` |
+| `silver_weight.parquet` | `date`, `weight_kg`, `bmi`, `body_fat_pct`, `muscle_mass_kg` |
 
 ### Gold (DuckDB in-memory)
 
@@ -212,6 +222,7 @@ uv run python src/db/transformations.py
 | `gold_health` | `silver_health_telemetry.parquet` |
 | `gold_runs` | All `silver_run_*.parquet` (union by name) |
 | `gold_hydration` | `silver_hydration.parquet` |
+| `gold_weight` | `silver_weight.parquet` |
 
 The database is **in-memory** (`:memory:`) to allow Streamlit and FastAPI to run simultaneously without file-lock conflicts.
 
@@ -222,11 +233,11 @@ The database is **in-memory** (`:memory:`) to allow Streamlit and FastAPI to run
 | Section | Data source | What it shows |
 |---|---|---|
 | Sidebar — Daily Readiness | `get_health_trend(7)` | HRV, RHR, Body Battery, Sleep vs 7d avg + soreness slider |
-| Race Countdown | `athlete_config.json` | Days to race, target pace, shoe mileage % |
+| Race Countdown | `athlete_config.json` + `load_race_predictions()` | Days to race, target pace, shoe mileage %, Garmin race time predictions with HM delta vs target |
 | Load Balance | `get_training_load_history(42)` | ATL / CTL / TSB — requires LTHR |
 | Intensity Distribution | `get_weekly_intensity(2)` | % time per HR zone vs 80/20 target |
 | Run Efficiency | `get_efficiency_trend(16)` | Pace vs HR on easy runs (avg HR < Z3 threshold) |
-| Historical Trends | `get_health_trend(30)` | HRV/Battery, RHR, Sleep Score, Hydration |
+| Historical Trends | `get_health_trend(30)` | HRV/Battery, RHR, Sleep Score, Hydration, Weight (30-day with trend line) |
 
 ---
 

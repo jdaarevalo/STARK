@@ -87,6 +87,65 @@ def extract_daily_health_summary(client, target_date):
     logger.info(f"Health telemetry saved to {filename}")
 
 
+def extract_weight_history(client, days: int = 30) -> None:
+    """Extracts weigh-in history for the last N days from Garmin Connect."""
+    today = date.today()
+    start = (today - timedelta(days=days)).isoformat()
+    end = today.isoformat()
+    logger.info(f"Extracting weight history from {start} to {end}...")
+    try:
+        data = client.get_weigh_ins(start, end)
+        RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        filename = RAW_DATA_DIR / f"weight_history_{today}.json"
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=4)
+        logger.info(f"Weight history saved to {filename}")
+    except Exception as e:
+        logger.error(f"Error extracting weight history: {e}")
+
+
+def extract_training_plan(client) -> None:
+    """Extracts the active Garmin Coach adaptive training plan."""
+    logger.info("Extracting Garmin Coach training plan...")
+    try:
+        plans = client.get_training_plans()
+        plan_list = plans.get("trainingPlanList") or []
+        # Pick the most recently created active plan
+        active = sorted(
+            [p for p in plan_list if p.get("trainingStatus", {}).get("statusKey") == "Scheduled"],
+            key=lambda p: p.get("createDate", ""),
+            reverse=True,
+        )
+        if not active:
+            logger.warning("No active Garmin Coach plan found.")
+            return
+        plan_id = active[0]["trainingPlanId"]
+        data = client.get_adaptive_training_plan_by_id(plan_id)
+        RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        today = date.today().isoformat()
+        filename = RAW_DATA_DIR / f"training_plan_{today}.json"
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=4)
+        logger.info(f"Training plan saved to {filename}")
+    except Exception as e:
+        logger.error(f"Error extracting training plan: {e}")
+
+
+def extract_race_predictions(client) -> None:
+    """Extracts Garmin's current race time predictions (5K, 10K, HM, Marathon)."""
+    logger.info("Extracting race predictions...")
+    try:
+        data = client.get_race_predictions()
+        RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        today = date.today().isoformat()
+        filename = RAW_DATA_DIR / f"race_predictions_{today}.json"
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=4)
+        logger.info(f"Race predictions saved to {filename}")
+    except Exception as e:
+        logger.error(f"Error extracting race predictions: {e}")
+
+
 def extract_hydration(client, target_date) -> None:
     """Extracts daily hydration intake from Garmin Connect."""
     date_str = target_date.isoformat()
@@ -167,22 +226,28 @@ def run_full_extraction() -> None:
     last_extracted = get_last_extracted_date()
     logger.info(f"Extracting data from {last_extracted} to {today} (inclusive)...")
 
+    # Sleep and health: re-fetch today and yesterday (may be incomplete until end of day).
+    # Hydration: re-fetch last 7 days — users log water retroactively throughout the day
+    # and Garmin's sync delay means earlier days can still update after the fact.
+    biometric_refresh_cutoff = today - timedelta(days=1)
+    hydration_refresh_cutoff = today - timedelta(days=7)
+
     current = last_extracted
     while current <= today:
         sleep_file = RAW_DATA_DIR / f"sleep_data_{current}.json"
-        if not sleep_file.exists():
+        if not sleep_file.exists() or current >= biometric_refresh_cutoff:
             extract_sleep_data(client, current)
         else:
             logger.info(f"Skipping sleep data for {current} — already extracted.")
 
         health_file = RAW_DATA_DIR / f"health_telemetry_{current}.json"
-        if not health_file.exists():
+        if not health_file.exists() or current >= biometric_refresh_cutoff:
             extract_daily_health_summary(client, current)
         else:
             logger.info(f"Skipping health telemetry for {current} — already extracted.")
 
         hydration_file = RAW_DATA_DIR / f"hydration_{current}.json"
-        if not hydration_file.exists():
+        if not hydration_file.exists() or current >= hydration_refresh_cutoff:
             extract_hydration(client, current)
         else:
             logger.info(f"Skipping hydration for {current} — already extracted.")
@@ -190,6 +255,9 @@ def run_full_extraction() -> None:
         current += timedelta(days=1)
 
     extract_runs_in_range(client, last_extracted, today)
+    extract_training_plan(client)
+    extract_race_predictions(client)
+    extract_weight_history(client, days=30)
     logger.info("Extraction pipeline finished.")
 
 
