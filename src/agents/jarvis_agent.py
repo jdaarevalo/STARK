@@ -15,14 +15,25 @@ from datetime import date
 from pathlib import Path
 from typing import Generator
 
+import duckdb
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from pydantic_ai import Agent
+from pydantic_ai.tools import GenerateToolJsonSchema
 
 from src.config.agents import get_google_model
 from src.db.connection import StarkDatabase, load_athlete_config, load_daily_inputs, load_race_predictions, load_training_plan
 
 logger = logging.getLogger(__name__ if __name__ != "__main__" else "src.agents.jarvis_agent")
+
+
+class _LenientSchema(GenerateToolJsonSchema):
+    """Removes additionalProperties: false so Gemini extra fields don't cause ToolRetryError."""
+    def generate(self, schema, mode="validation"):
+        result = super().generate(schema, mode=mode)
+        result.pop("additionalProperties", None)
+        return result
 
 # Schema hint passed to query_athlete_data so the LLM knows what columns exist.
 _GOLD_SCHEMA = """
@@ -47,6 +58,16 @@ gold_hydration — one row per day (may not exist)
 gold_weight — one row per day (may not exist)
   date, weight_kg, bmi, body_fat_pct, muscle_mass_kg
 
+gold_strength_sessions — one row per strength session (may not exist)
+  activity_id, date, name, duration_min, active_min, calories,
+  avg_hr, max_hr, total_sets, active_sets, total_reps,
+  training_load, body_battery_drain, aerobic_te, anaerobic_te,
+  training_effect_label, pct_z1, pct_z2, pct_z3, pct_z4, pct_z5
+
+gold_strength_sets — one row per active exercise set (may not exist)
+  activity_id, date, set_start_time, exercise_category, exercise_name,
+  reps, weight_kg, duration_sec
+
 Notes:
 - cadence in gold_runs is HALF-cadence; multiply by 2 for steps-per-minute.
 - To aggregate per run: GROUP BY source_file, use MIN(timestamp) as run date.
@@ -54,7 +75,7 @@ Notes:
 - HOUR(timestamp) extracts the hour for time-of-day analysis.
 """
 
-SYSTEM_PROMPT = f"""
+_INSTRUCTIONS = f"""
 You are J.A.R.V.I.S. — the athletic intelligence core of S.T.A.R.K.
 You operate as a panel of three integrated experts who analyse the athlete's data
 and deliver a single, unified recommendation. Never address them as separate voices;
@@ -86,14 +107,25 @@ OPERATING RULES:
 
 TOOL USAGE GUIDE:
 - get_training_load         → load/fatigue/injury-risk questions, session planning
-- get_recent_runs(n)        → questions about specific past runs, last session, weekly volume
+- get_recent_runs(n)        → ALWAYS use this for any question about runs, last session,
+                              today's run, this week's volume, biomechanics, pacing review.
+                              Returns pre-computed pace, cadence, GCT, drift metrics, and
+                              HR zones — do NOT use query_athlete_data for run analysis.
+- get_strength_sessions(n)  → questions about gym/strength sessions, exercise history,
+                              sets/reps volume, cross-training load, activation work.
 - get_health_trend(days)    → multi-day HRV/sleep/RHR trend questions
 - get_upcoming_workouts()   → full week Garmin Coach schedule, upcoming session details
-- query_athlete_data(sql)   → anything not covered above (time-of-day patterns, correlations, etc.)
+- query_athlete_data(sql)   → ONLY for questions that cannot be answered by the above tools:
+                              time-of-day patterns, custom correlations, one-off historical
+                              queries. NEVER use it to look up run or strength data.
 
 NOTE: The DATA CONTEXT already contains today's and tomorrow's scheduled workouts under
 'garmin_coach_today_tomorrow'. Call get_upcoming_workouts() only when the user asks about
 the full week or sessions beyond tomorrow.
+
+NOTE: The DATA CONTEXT 'recovery' block includes a 'data_freshness' field. If it says
+'latest_available', the values are from a prior day — state the actual data date when
+reporting recovery metrics, never claim they are from today.
 
 GOLD LAYER SCHEMA (for query_athlete_data):
 {_GOLD_SCHEMA}
@@ -104,7 +136,7 @@ def build_agent() -> Agent:
     logger.info("J.A.R.V.I.S. unified agent initialized.")
     return Agent(
         model=get_google_model(),
-        system_prompt=SYSTEM_PROMPT,
+        instructions=_INSTRUCTIONS,
         output_type=str,
     )
 
@@ -127,14 +159,15 @@ def get_training_load() -> dict:
     return db.get_training_load_snapshot(lthr=lthr)
 
 
-@agent.tool_plain
+@agent.tool_plain(schema_generator=_LenientSchema)
 def get_recent_runs(limit: int = 5) -> list:
     """
     Returns detailed telemetry + biomechanics for the last N runs (default 5), newest first.
     Each run includes: date, distance_km, duration_min, avg_pace, avg_hr, hr_zones_pct,
     avg_cadence_spm, avg_gct_ms, avg_power_w, and fatigue drift metrics
     (cadence_drift_spm, hr_drift_bpm, pace_first_third, pace_last_third).
-    Use for: questions about specific past runs, last session analysis,
+    ALWAYS use this tool for any run-related question. Do NOT use query_athlete_data for runs.
+    Use for: questions about specific past runs, last session analysis, today's run,
     weekly volume, biomechanics review, "how was my last run?", post-run nutrition.
     Pass limit=1 for last run only, up to 10 for trend analysis.
     """
@@ -144,7 +177,7 @@ def get_recent_runs(limit: int = 5) -> list:
     return db.get_biomechanics_snapshot(limit=limit, lthr=lthr)
 
 
-@agent.tool_plain
+@agent.tool_plain(schema_generator=_LenientSchema)
 def get_health_trend(days: int = 14) -> list:
     """
     Returns daily health metrics for the last N days (default 14), oldest first.
@@ -168,7 +201,22 @@ def get_upcoming_workouts() -> dict:
     return load_training_plan()
 
 
-@agent.tool_plain
+@agent.tool_plain(schema_generator=_LenientSchema)
+def get_strength_sessions(days: int = 14) -> list:
+    """
+    Returns strength training sessions for the last N days (default 14), newest first.
+    Each session includes: date, name, duration_min, active_min, calories, avg_hr, max_hr,
+    total_sets, total_reps, training_load, body_battery_drain, aerobic_te,
+    training_effect_label, and a list of exercises (category, name, sets, total_reps,
+    max_weight_kg).
+    Use for: questions about gym sessions, strength volume, exercise history,
+    cross-training load, "what did I do in the gym?", pre/post-run activation work.
+    """
+    db = StarkDatabase()
+    return db.get_strength_snapshot(days=days)
+
+
+@agent.tool_plain(schema_generator=_LenientSchema)
 def query_athlete_data(sql: str) -> list:
     """
     Executes a read-only SQL SELECT against the athlete's DuckDB gold layer.
@@ -185,8 +233,8 @@ def query_athlete_data(sql: str) -> list:
     try:
         result = db.conn.execute(sql_stripped).df()
         return result.head(100).to_dict(orient="records")
-    except Exception as e:
-        logger.error("query_athlete_data failed: %s | sql: %s", e, sql_stripped)
+    except duckdb.Error as e:
+        logger.warning("query_athlete_data SQL error: %s | sql: %s", e, sql_stripped)
         return [{"error": str(e)}]
 
 

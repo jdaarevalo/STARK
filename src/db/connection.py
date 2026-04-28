@@ -98,6 +98,27 @@ class StarkDatabase:
             FROM read_parquet('{PROCESSED_DIR}/silver_run_*.parquet', union_by_name=true, filename=true)
         """)
 
+        hr_zones_parquet = PROCESSED_DIR / "silver_hr_zones.parquet"
+        if hr_zones_parquet.exists():
+            self.conn.execute(f"""
+                CREATE OR REPLACE VIEW gold_hr_zones AS
+                SELECT * FROM read_parquet('{hr_zones_parquet}')
+            """)
+
+        strength_sessions_parquet = PROCESSED_DIR / "silver_strength_sessions.parquet"
+        if strength_sessions_parquet.exists():
+            self.conn.execute(f"""
+                CREATE OR REPLACE VIEW gold_strength_sessions AS
+                SELECT * FROM read_parquet('{strength_sessions_parquet}')
+            """)
+
+        strength_sets_parquet = PROCESSED_DIR / "silver_strength_sets.parquet"
+        if strength_sets_parquet.exists():
+            self.conn.execute(f"""
+                CREATE OR REPLACE VIEW gold_strength_sets AS
+                SELECT * FROM read_parquet('{strength_sets_parquet}')
+            """)
+
         hydration_parquet = PROCESSED_DIR / "silver_hydration.parquet"
         if hydration_parquet.exists():
             self.conn.execute(f"""
@@ -356,12 +377,84 @@ class StarkDatabase:
             logger.error(f"Failed to retrieve readiness for {target_date}: {e}")
             return None
 
+    def has_garmin_hr_zones(self) -> bool:
+        """Returns True when gold_hr_zones view exists and has at least one row."""
+        try:
+            row = self.conn.execute("SELECT COUNT(*) FROM gold_hr_zones").fetchone()
+            return bool(row and row[0] > 0)
+        except Exception:
+            return False
+
     def get_weekly_intensity(self, weeks: int = 2, lthr: Optional[int] = None) -> list:
         """
         Returns minutes spent per HR zone per week for the last N weeks.
-        Zone thresholds use Friel % of LTHR when provided; fall back to absolute bpm defaults.
-        Each row: week_start, z1_min, z2_min, z3_min, z4_min, z5_min, total_min.
+        Uses Garmin's own zone definitions (from gold_hr_zones) when available —
+        these match what the athlete sees on their watch and Garmin Connect.
+        Falls back to Friel % of LTHR when no Garmin zone data has been extracted yet.
+        Each row: week_start, z1_min, z2_min, z3_min, z4_min, z5_min, total_min, source.
         """
+        if self.has_garmin_hr_zones():
+            return self._get_weekly_intensity_garmin(weeks)
+        return self._get_weekly_intensity_friel(weeks, lthr)
+
+    def _get_weekly_intensity_garmin(self, weeks: int) -> list:
+        """Weekly intensity using Garmin's official zone percentages per activity."""
+        query = """
+            WITH run_durations AS (
+                SELECT
+                    source_file,
+                    -- extract activity_id from the parquet filename
+                    REGEXP_EXTRACT(source_file, 'silver_run_(\\d+)\\.parquet', 1) AS activity_id,
+                    CAST(MIN(timestamp) AS DATE)                                  AS run_date,
+                    epoch_ms(MAX(timestamp) - MIN(timestamp)) / 60000.0           AS duration_min
+                FROM gold_runs
+                GROUP BY source_file
+            ),
+            joined AS (
+                SELECT
+                    r.run_date,
+                    r.duration_min,
+                    z.pct_z1, z.pct_z2, z.pct_z3, z.pct_z4, z.pct_z5
+                FROM run_durations r
+                JOIN gold_hr_zones z ON r.activity_id = z.activity_id
+            ),
+            weekly AS (
+                SELECT
+                    DATE_TRUNC('week', run_date)::DATE           AS week_start,
+                    SUM(duration_min * pct_z1 / 100.0)          AS z1_min,
+                    SUM(duration_min * pct_z2 / 100.0)          AS z2_min,
+                    SUM(duration_min * pct_z3 / 100.0)          AS z3_min,
+                    SUM(duration_min * pct_z4 / 100.0)          AS z4_min,
+                    SUM(duration_min * pct_z5 / 100.0)          AS z5_min
+                FROM joined
+                GROUP BY DATE_TRUNC('week', run_date)::DATE
+                ORDER BY week_start DESC
+                LIMIT ?
+            )
+            SELECT
+                week_start,
+                ROUND(COALESCE(z1_min, 0), 1) AS z1_min,
+                ROUND(COALESCE(z2_min, 0), 1) AS z2_min,
+                ROUND(COALESCE(z3_min, 0), 1) AS z3_min,
+                ROUND(COALESCE(z4_min, 0), 1) AS z4_min,
+                ROUND(COALESCE(z5_min, 0), 1) AS z5_min,
+                ROUND(COALESCE(z1_min, 0) + COALESCE(z2_min, 0) + COALESCE(z3_min, 0)
+                    + COALESCE(z4_min, 0) + COALESCE(z5_min, 0), 1) AS total_min,
+                'garmin' AS source
+            FROM weekly
+            ORDER BY week_start ASC
+        """
+        try:
+            result = self.conn.execute(query, [weeks]).df()
+            if result.empty:
+                return []
+            return result.to_dict(orient="records")
+        except Exception as e:
+            logger.error(f"Failed to retrieve weekly intensity (Garmin zones): {e}")
+            return []
+
+    def _get_weekly_intensity_friel(self, weeks: int, lthr: Optional[int] = None) -> list:
+        """Weekly intensity using Friel zone thresholds (fallback when no Garmin zone data)."""
         z1, z2, z3, z4 = _zone_thresholds(lthr)
         query = f"""
             WITH runs AS (
@@ -401,7 +494,8 @@ class StarkDatabase:
                 COALESCE(z4_min, 0) AS z4_min,
                 COALESCE(z5_min, 0) AS z5_min,
                 COALESCE(z1_min, 0) + COALESCE(z2_min, 0) + COALESCE(z3_min, 0)
-                    + COALESCE(z4_min, 0) + COALESCE(z5_min, 0)                                AS total_min
+                    + COALESCE(z4_min, 0) + COALESCE(z5_min, 0)                                AS total_min,
+                'friel_fallback' AS source
             FROM weekly
             ORDER BY week_start ASC
         """
@@ -411,7 +505,7 @@ class StarkDatabase:
                 return []
             return result.to_dict(orient="records")
         except Exception as e:
-            logger.error(f"Failed to retrieve weekly intensity: {e}")
+            logger.error(f"Failed to retrieve weekly intensity (Friel): {e}")
             return []
 
     def get_efficiency_trend(self, weeks: int = 16, lthr: Optional[int] = None) -> list:
@@ -567,8 +661,9 @@ class StarkDatabase:
     def get_readiness_snapshot(self, today: str) -> dict:
         """
         Pre-computed recovery summary for the J.A.R.V.I.S. unified agent.
-        Returns today's biometrics alongside 7-day averages and deltas — ready
-        for the LLM to interpret without further arithmetic.
+        Returns the most recent available biometrics alongside 7-day averages and deltas.
+        When today's sync has not run yet, falls back to the latest available date and
+        includes a 'data_freshness' note so the LLM reports the correct date.
         """
         rows = self.get_health_trend(days=8)
         if not rows:
@@ -579,7 +674,18 @@ class StarkDatabase:
 
         today_date = date.fromisoformat(today)
         today_row = df[df["date"] == today_date]
-        past_7 = df[df["date"] < today_date].tail(7)
+
+        # If today has no data, fall back to the most recent available date
+        if today_row.empty:
+            data_row = df.sort_values("date").iloc[-1:]
+            data_date = str(data_row["date"].iloc[0])
+            data_freshness = f"latest_available — data is from {data_date}, today's sync has not run yet"
+        else:
+            data_row = today_row
+            data_date = today
+            data_freshness = "current"
+
+        past_7 = df[df["date"] < date.fromisoformat(data_date)].tail(7)
 
         def _val(series, col):
             v = series[col].dropna()
@@ -594,19 +700,21 @@ class StarkDatabase:
                 return round(today_val - avg_val, 1)
             return None
 
-        hrv_today = _val(today_row, "hrv_last_night_avg") if not today_row.empty else None
+        hrv_today = _val(data_row, "hrv_last_night_avg")
         hrv_avg   = _avg(past_7, "hrv_last_night_avg")
-        rhr_today = _val(today_row, "resting_heart_rate") if not today_row.empty else None
+        rhr_today = _val(data_row, "resting_heart_rate")
         rhr_avg   = _avg(past_7, "resting_heart_rate")
-        bb_today  = _val(today_row, "body_battery_end") if not today_row.empty else None
+        bb_today  = _val(data_row, "body_battery_end")
         bb_avg    = _avg(past_7, "body_battery_end")
-        sleep_today = _val(today_row, "sleep_score") if not today_row.empty else None
+        sleep_today = _val(data_row, "sleep_score")
         sleep_avg   = _avg(past_7, "sleep_score")
 
-        hrv_status = today_row["hrv_status"].iloc[0] if not today_row.empty and today_row["hrv_status"].notna().any() else None
+        hrv_status = data_row["hrv_status"].iloc[0] if data_row["hrv_status"].notna().any() else None
 
         return {
             "date": today,
+            "data_date": data_date,
+            "data_freshness": data_freshness,
             "hrv_ms": hrv_today,
             "hrv_7d_avg_ms": hrv_avg,
             "hrv_delta_ms": _delta(hrv_today, hrv_avg),
@@ -703,11 +811,27 @@ class StarkDatabase:
         Condensed biomechanics summary for the J.A.R.V.I.S. unified agent.
         Returns last N runs with pre-computed drift fields and human-readable
         flag labels — no raw row data that forces the LLM to do arithmetic.
+        HR zone percentages come from Garmin's own definitions when available;
+        fall back to Friel thresholds otherwise.
         """
         from src.models.biometrics import format_pace
         rows = self.get_run_biomechanics(limit=limit, lthr=lthr)
         if not rows:
             return []
+
+        # Build a lookup of Garmin zone percentages keyed by activity_id
+        garmin_zones: dict[str, dict] = {}
+        if self.has_garmin_hr_zones():
+            try:
+                gz = self.conn.execute("SELECT * FROM gold_hr_zones").df()
+                for _, r in gz.iterrows():
+                    garmin_zones[str(r["activity_id"])] = {
+                        "z1": r["pct_z1"], "z2": r["pct_z2"], "z3": r["pct_z3"],
+                        "z4": r["pct_z4"], "z5": r["pct_z5"],
+                        "source": "garmin",
+                    }
+            except Exception as e:
+                logger.warning(f"Could not load Garmin HR zones for snapshot: {e}")
 
         result = []
         for row in rows:
@@ -717,6 +841,19 @@ class StarkDatabase:
                 cadence_drift = round(row["cadence_last_third_spm"] - row["cadence_first_third_spm"], 1)
             if row.get("hr_last_third") and row.get("hr_first_third"):
                 hr_drift = round(row["hr_last_third"] - row["hr_first_third"], 1)
+
+            # Extract activity_id from source_file path
+            import re
+            match = re.search(r"silver_run_(\d+)\.parquet", str(row.get("source_file", "")))
+            activity_id = match.group(1) if match else None
+            if activity_id and activity_id in garmin_zones:
+                hr_zones = garmin_zones[activity_id]
+            else:
+                hr_zones = {
+                    "z1": row["pct_z1"], "z2": row["pct_z2"], "z3": row["pct_z3"],
+                    "z4": row["pct_z4"], "z5": row["pct_z5"],
+                    "source": "friel_fallback",
+                }
 
             result.append({
                 "run_date": str(row["run_date"])[:10],
@@ -730,10 +867,7 @@ class StarkDatabase:
                 "avg_step_length_mm": row["avg_step_length_mm"],
                 "avg_power_w": row["avg_power_w"],
                 "avg_hr": row["avg_hr"],
-                "hr_zones_pct": {
-                    "z1": row["pct_z1"], "z2": row["pct_z2"], "z3": row["pct_z3"],
-                    "z4": row["pct_z4"], "z5": row["pct_z5"],
-                },
+                "hr_zones_pct": hr_zones,
                 "cadence_drift_spm": cadence_drift,
                 "hr_drift_bpm": hr_drift,
                 "pace_first_third": format_pace(row.get("speed_first_third_m_s") or 0),
@@ -779,6 +913,112 @@ class StarkDatabase:
         except Exception as e:
             logger.error(f"Failed to retrieve weight snapshot: {e}")
             return {"status": "no_data"}
+
+    def get_strength_snapshot(self, days: int = 14) -> list:
+        """
+        Returns recent strength sessions with per-session exercise summary for the agent.
+        Each entry includes session metadata and a list of unique exercises performed,
+        with total sets and reps aggregated from the set-level data when available.
+        """
+        since = (date.today() - timedelta(days=days)).isoformat()
+
+        # Check views exist
+        try:
+            self.conn.execute("SELECT 1 FROM gold_strength_sessions LIMIT 1")
+        except Exception:
+            return []
+
+        # Session-level data
+        sessions_query = """
+            SELECT
+                activity_id,
+                CAST(date AS DATE)      AS date,
+                name,
+                duration_min,
+                active_min,
+                calories,
+                avg_hr,
+                max_hr,
+                total_sets,
+                active_sets,
+                total_reps,
+                training_load,
+                body_battery_drain,
+                aerobic_te,
+                training_effect_label
+            FROM gold_strength_sessions
+            WHERE CAST(date AS DATE) >= CAST(? AS DATE)
+            ORDER BY date DESC
+        """
+        try:
+            sessions_df = self.conn.execute(sessions_query, [since]).df()
+        except Exception as e:
+            logger.error(f"Failed to retrieve strength sessions: {e}")
+            return []
+
+        if sessions_df.empty:
+            return []
+
+        # Set-level exercise summary — aggregate by activity + exercise
+        sets_available = False
+        try:
+            self.conn.execute("SELECT 1 FROM gold_strength_sets LIMIT 1")
+            sets_available = True
+        except Exception:
+            pass
+
+        exercises_by_activity: dict[str, list] = {}
+        if sets_available:
+            try:
+                sets_query = """
+                    SELECT
+                        activity_id,
+                        exercise_category,
+                        exercise_name,
+                        COUNT(*)            AS sets_count,
+                        SUM(reps)           AS total_reps,
+                        MAX(weight_kg)      AS max_weight_kg
+                    FROM gold_strength_sets
+                    WHERE CAST(date AS DATE) >= CAST(? AS DATE)
+                      AND exercise_category IS NOT NULL
+                    GROUP BY activity_id, exercise_category, exercise_name
+                    ORDER BY activity_id, sets_count DESC
+                """
+                sets_df = self.conn.execute(sets_query, [since]).df()
+                for aid, grp in sets_df.groupby("activity_id"):
+                    exercises_by_activity[str(aid)] = [
+                        {
+                            "category": r["exercise_category"],
+                            "name": r["exercise_name"],
+                            "sets": int(r["sets_count"]),
+                            "total_reps": int(r["total_reps"]) if r["total_reps"] else None,
+                            "max_weight_kg": r["max_weight_kg"],
+                        }
+                        for _, r in grp.iterrows()
+                    ]
+            except Exception as e:
+                logger.warning(f"Could not load strength sets: {e}")
+
+        result = []
+        for _, row in sessions_df.iterrows():
+            aid = str(row["activity_id"])
+            result.append({
+                "date": str(row["date"])[:10],
+                "name": row["name"],
+                "duration_min": row["duration_min"],
+                "active_min": row["active_min"],
+                "calories": row["calories"],
+                "avg_hr": row["avg_hr"],
+                "max_hr": row["max_hr"],
+                "total_sets": row["total_sets"],
+                "total_reps": row["total_reps"],
+                "training_load": row["training_load"],
+                "body_battery_drain": row["body_battery_drain"],
+                "aerobic_te": row["aerobic_te"],
+                "training_effect_label": row["training_effect_label"],
+                "exercises": exercises_by_activity.get(aid, []),
+            })
+        return result
 
     def close(self) -> None:
         """Shuts down the Arc Reactor safely."""

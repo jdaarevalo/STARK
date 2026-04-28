@@ -29,11 +29,12 @@ import asyncio
 import json
 import logging
 import uuid
-from collections import defaultdict
 
 import uvicorn
-from fastapi import FastAPI, Request, Response
+from cachetools import TTLCache
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
 
 from src.agents.jarvis_agent import agent as orchestrator, build_context_with_steps
 
@@ -42,7 +43,8 @@ logger = logging.getLogger("src.chat.fastapi_app")
 app = FastAPI(title="J.A.R.V.I.S.")
 
 # In-memory session store: session_id → list of pydantic-ai messages
-_sessions: dict[str, list] = defaultdict(list)
+# TTL of 1 hour, max 100 concurrent sessions
+_sessions: TTLCache = TTLCache(maxsize=100, ttl=3600)
 
 _SESSION_COOKIE = "jarvis_session"
 
@@ -314,7 +316,6 @@ async function sendMessage() {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let fullText = "";
     let responding = false;
 
     while (true) {
@@ -345,8 +346,7 @@ async function sendMessage() {
               assistantEl.style.display = "";
               responding = true;
             }
-            fullText += msg.delta;
-            assistantEl.textContent = fullText;
+            assistantEl.textContent = msg.delta;
             scrollBottom();
           }
         } catch (_) {}
@@ -355,7 +355,7 @@ async function sendMessage() {
 
     if (!responding) {
       assistantEl.style.display = "";
-      assistantEl.textContent = fullText || "(no response)";
+      assistantEl.textContent = "(no response)";
     }
 
   } catch (err) {
@@ -395,24 +395,28 @@ async def root():
     return HTMLResponse(_HTML)
 
 
+class ChatRequest(BaseModel):
+    message: str
+
+
 @app.post("/chat")
-async def chat(request: Request):
-    body = await request.json()
-    user_message: str = body.get("message", "").strip()
+async def chat(body: ChatRequest, request: Request):
+    user_message = body.message.strip()
     if not user_message:
-        return Response(status_code=400, content="message is required")
+        raise HTTPException(status_code=400, detail="message is required")
 
     session_id = _get_or_create_session(request)
-    history = _sessions[session_id]
+    history = _sessions.get(session_id, [])
     logger.info("session=%s | user: %s", session_id, user_message[:80])
 
     async def event_stream():
         is_first_message = len(history) == 0
 
         if is_first_message:
-            # Load and stream telemetry steps only on the first turn
+            # Load context in a thread to avoid blocking the event loop
             ctx_json = ""
-            for label, detail in build_context_with_steps():
+            steps = await asyncio.to_thread(list, build_context_with_steps())
+            for label, detail in steps:
                 if label == "__context__":
                     ctx_json = detail
                 else:
@@ -423,21 +427,9 @@ async def chat(request: Request):
 
         yield "data: " + json.dumps({"step": "Consulting J.A.R.V.I.S.…", "detail": None}) + "\n\n"
         try:
-            coro = orchestrator.run(
-                prompt,
-                message_history=history,
-            )
-            task = asyncio.ensure_future(coro)
-            while True:
-                done, _ = await asyncio.wait({task}, timeout=3)
-                if done:
-                    break
-                yield "data: " + json.dumps({"status": "thinking"}) + "\n\n"
-            result = task.result()
-            text: str = result.output or ""
-            chunk_size = 12
-            for i in range(0, len(text), chunk_size):
-                yield "data: " + json.dumps({"delta": text[i:i + chunk_size]}) + "\n\n"
+            async with orchestrator.run_stream(prompt, message_history=history) as result:
+                async for text in result.stream_output(debounce_by=0.01):
+                    yield "data: " + json.dumps({"delta": text}) + "\n\n"
             _sessions[session_id] = result.all_messages()
         except Exception as e:
             logger.error("Orchestrator error: %s", e, exc_info=True)
@@ -453,7 +445,7 @@ async def chat(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
-    response.set_cookie(_SESSION_COOKIE, session_id, samesite="lax", httponly=True)
+    response.set_cookie(_SESSION_COOKIE, session_id, samesite="lax", httponly=True, max_age=3600)
     return response
 
 

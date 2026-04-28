@@ -146,10 +146,27 @@ _TOOLTIPS = {
 }
 
 
-def _intensity_tooltip(lthr: int = 0) -> str:
+def _intensity_tooltip(lthr: int = 0, zone_source: str = "friel_fallback") -> str:
     from src.db.connection import _zone_thresholds
-    z1, z2, z3, z4 = _zone_thresholds(lthr or None)
-    src = f"Friel zones based on your LTHR of {lthr} bpm" if lthr else "default absolute thresholds (set LTHR in Athlete Config for personalised zones)"
+    if zone_source == "garmin":
+        src = "Garmin's own zone definitions (matches your watch and Garmin Connect)"
+        zone_lines = (
+            "- **Z1** — Very easy / recovery\n"
+            "- **Z2** — Aerobic base, fat oxidation zone\n"
+            "- **Z3** — Tempo / threshold approach\n"
+            "- **Z4** — Lactate threshold work\n"
+            "- **Z5** — VO₂max / sprint intervals\n"
+        )
+    else:
+        z1, z2, z3, z4 = _zone_thresholds(lthr or None)
+        src = f"Friel zones based on your LTHR of {lthr} bpm" if lthr else "default absolute thresholds (set LTHR in Athlete Config for personalised zones)"
+        zone_lines = (
+            f"- **Z1 (<{z1} bpm)** — Recovery / very easy\n"
+            f"- **Z2 ({z1}–{z2 - 1} bpm)** — Aerobic base, fat oxidation zone\n"
+            f"- **Z3 ({z2}–{z3 - 1} bpm)** — Tempo / threshold approach\n"
+            f"- **Z4 ({z3}–{z4 - 1} bpm)** — Lactate threshold work\n"
+            f"- **Z5 (≥{z4} bpm)** — VO₂max / sprint intervals\n"
+        )
     return (
         "**Intensity Distribution — 80/20 Rule**\n\n"
         "Validates your training strategy. Elite endurance athletes spend ~80% "
@@ -157,11 +174,7 @@ def _intensity_tooltip(lthr: int = 0) -> str:
         "Amateur runners often fail at half marathon because they run their "
         "easy days too fast, accumulating hidden fatigue.\n\n"
         f"Zone thresholds: {src}.\n\n"
-        f"- **Z1 (<{z1} bpm)** — Recovery / very easy\n"
-        f"- **Z2 ({z1}–{z2 - 1} bpm)** — Aerobic base, fat oxidation zone\n"
-        f"- **Z3 ({z2}–{z3 - 1} bpm)** — Tempo / threshold approach\n"
-        f"- **Z4 ({z3}–{z4 - 1} bpm)** — Lactate threshold work\n"
-        f"- **Z5 (≥{z4} bpm)** — VO₂max / sprint intervals\n\n"
+        f"{zone_lines}\n"
         "The white dotted line marks the 80% target. "
         "Ideally, the green+light-green bar reaches that line."
     )
@@ -513,18 +526,25 @@ def _load_balance_summary(df: pd.DataFrame) -> None:
 
 def chart_intensity_distribution(intensity_df: pd.DataFrame, lthr: int = 0) -> go.Figure:
     from src.db.connection import _zone_thresholds
-    z1, z2, z3, z4 = _zone_thresholds(lthr or None)
+
+    zone_source = intensity_df["source"].iloc[0] if "source" in intensity_df.columns else "friel_fallback"
+
+    if zone_source == "garmin":
+        zone_labels = ["Z1", "Z2", "Z3", "Z4", "Z5"]
+        source_label = "Garmin zones"
+    else:
+        z1, z2, z3, z4 = _zone_thresholds(lthr or None)
+        zone_labels = [
+            f"Z1 (<{z1})",
+            f"Z2 ({z1}–{z2 - 1})",
+            f"Z3 ({z2}–{z3 - 1})",
+            f"Z4 ({z3}–{z4 - 1})",
+            f"Z5 (≥{z4})",
+        ]
+        source_label = f"Friel / LTHR {lthr} bpm" if lthr else "Default thresholds"
 
     zone_colors = ["#2ca02c", "#98df8a", "#ffbb78", "#ff7f0e", "#d62728"]
     zone_cols = ["z1_min", "z2_min", "z3_min", "z4_min", "z5_min"]
-    zone_labels = [
-        f"Z1 (<{z1})",
-        f"Z2 ({z1}–{z2 - 1})",
-        f"Z3 ({z2}–{z3 - 1})",
-        f"Z4 ({z3}–{z4 - 1})",
-        f"Z5 (≥{z4})",
-    ]
-    source = f"LTHR-based ({lthr} bpm)" if lthr else "Default thresholds"
 
     fig = go.Figure()
     week_labels = intensity_df["week_start"].dt.strftime("Week of %b %d")
@@ -542,7 +562,7 @@ def chart_intensity_distribution(intensity_df: pd.DataFrame, lthr: int = 0) -> g
         annotation_text="80%", annotation_font_color="white", annotation_position="top",
     )
     fig.update_layout(
-        title=f"Intensity Distribution (80/20) — {source}",
+        title=f"Intensity Distribution (80/20) — {source_label}",
         barmode="stack",
         xaxis=dict(title="% of Total Time", range=[0, 100], ticksuffix="%"),
         yaxis=dict(autorange="reversed"),
@@ -645,12 +665,9 @@ def render_athlete_config_expander() -> dict:
             step=0.083, format="%.3f",
             help="e.g. 4.917 = 4:55 min/km. One second = 0.0167.",
         )
-        lthr = c1.number_input(
-            "LTHR (bpm)",
-            min_value=100, max_value=210,
-            value=int(config.get("lthr", 165)),
-            help="Lactate Threshold Heart Rate — used to calculate TSS for Load Balance.",
-        )
+        lthr_current = config.get("lthr")
+        if lthr_current:
+            c1.metric("LTHR (bpm)", lthr_current, help="Synced automatically from Garmin on each extraction.")
 
         st.markdown("**Shoes** — one per line: `Name | YYYY-MM-DD | max_km`")
         shoes_raw = config.get("shoes", [])
@@ -676,9 +693,11 @@ def render_athlete_config_expander() -> dict:
             new_config = {
                 "target_race_date": target_race_date.isoformat() if target_race_date else None,
                 "target_pace_min_per_km": round(target_pace, 3),
-                "lthr": lthr,
                 "shoes": shoes_parsed,
             }
+            # Preserve LTHR written by the extractor — never overwrite from the UI
+            if config.get("lthr"):
+                new_config["lthr"] = config["lthr"]
             save_athlete_config(new_config)
             st.success("Config saved.")
             st.cache_data.clear()
@@ -946,8 +965,9 @@ def render_dashboard(
 
     with col_right:
         lthr = int(athlete_config.get("lthr", 0))
+        zone_source = intensity_df["source"].iloc[0] if not intensity_df.empty and "source" in intensity_df.columns else "friel_fallback"
         _section_header("Intensity Distribution", "intensity_distribution",
-                        tooltip_text=_intensity_tooltip(lthr))
+                        tooltip_text=_intensity_tooltip(lthr, zone_source=zone_source))
         if not intensity_df.empty and intensity_df["total_min"].sum() > 0:
             st.plotly_chart(chart_intensity_distribution(intensity_df, lthr=lthr),
                             use_container_width=True)

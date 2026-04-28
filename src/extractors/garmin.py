@@ -149,6 +149,8 @@ def extract_race_predictions(client) -> None:
 def extract_lactate_threshold(client) -> None:
     """Fetches Garmin's latest device-estimated LTHR and updates athlete_config.json.
 
+    get_lactate_threshold(latest=True) returns:
+      {"speed_and_heart_rate": {"heartRate": <bpm>, ...}, "power": {...}}
     Only writes if a valid bpm value is found and it differs from the stored value.
     Non-fatal: logs a warning and returns if Garmin has no estimate yet.
     """
@@ -156,17 +158,11 @@ def extract_lactate_threshold(client) -> None:
     try:
         data = client.get_lactate_threshold(latest=True)
 
-        entry = data[0] if isinstance(data, list) else (data or {})
-
-        # Garmin may nest the value differently depending on device/firmware
-        lthr_bpm = (
-            entry.get("heartRateIntervalBpm")
-            or entry.get("lactateThresholdHeartRate")
-            or ((entry.get("heartRate") or {}).get("value"))
-        )
+        shr = (data or {}).get("speed_and_heart_rate") or {}
+        lthr_bpm = shr.get("heartRate")
 
         if not lthr_bpm or not isinstance(lthr_bpm, (int, float)):
-            logger.warning(f"No valid LTHR bpm found in Garmin response: {entry}")
+            logger.warning(f"No valid LTHR bpm found in Garmin response: {data}")
             return
 
         lthr_bpm = int(lthr_bpm)
@@ -190,6 +186,32 @@ def extract_lactate_threshold(client) -> None:
 
     except Exception as e:
         logger.error(f"Error extracting lactate threshold: {e}")
+
+
+def extract_hr_zones_for_run(client, activity_id: str | int) -> dict | None:
+    """
+    Fetches Garmin's official HR time-in-zones for a single run activity.
+    Returns a dict with zone number (1-5) as key and seconds spent as value,
+    plus the zone bpm limits as reported by Garmin.
+    Returns None on error or if Garmin has no zone data for the activity.
+    """
+    try:
+        data = client.get_activity_hr_in_timezones(str(activity_id))
+        if not data:
+            return None
+        zones = {}
+        for entry in data:
+            zone_num = entry.get("zoneNumber")
+            if zone_num is None:
+                continue
+            zones[zone_num] = {
+                "seconds_in_zone": entry.get("secsInZone"),
+                "zone_low_boundary": entry.get("zoneLowBoundary"),
+            }
+        return zones if zones else None
+    except Exception as e:
+        logger.warning(f"Could not fetch HR zones for activity {activity_id}: {e}")
+        return None
 
 
 def extract_hydration(client, target_date) -> None:
@@ -247,16 +269,102 @@ def extract_runs_in_range(client, start_date: date, end_date: date) -> None:
 
             if filename.exists():
                 logger.info(f"Skipping run {activity_id} on {start_time} — already downloaded.")
-                continue
+            else:
+                logger.info(f"Downloading .FIT for '{run.get('activityName', 'Run')}' on {start_time} (ID: {activity_id})...")
+                fit_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.ORIGINAL)
+                with open(filename, "wb") as f:
+                    f.write(fit_data)
+                logger.info(f"Saved {filename}")
 
-            logger.info(f"Downloading .FIT for '{run.get('activityName', 'Run')}' on {start_time} (ID: {activity_id})...")
-            fit_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.ORIGINAL)
-            with open(filename, "wb") as f:
-                f.write(fit_data)
-            logger.info(f"Saved {filename}")
+            # Always (re-)fetch HR zones — Garmin may compute them after the FIT is available
+            zones_filename = RAW_DATA_DIR / f"hr_zones_{start_time}_{activity_id}.json"
+            if not zones_filename.exists():
+                zones = extract_hr_zones_for_run(client, activity_id)
+                if zones:
+                    with open(zones_filename, "w") as f:
+                        json.dump({"activity_id": activity_id, "date": start_time, "zones": zones}, f, indent=2)
+                    logger.info(f"HR zones saved for activity {activity_id}")
 
     except Exception as e:
         logger.error(f"Error extracting runs in range: {e}")
+
+
+def extract_strength_activities(client, start_date: date, end_date: date) -> None:
+    """
+    Extracts strength training sessions between start_date and end_date.
+    Saves two JSON files per session:
+      - strength_training_{date}_{id}.json  — session-level summary (from activities list)
+      - strength_sets_{date}_{id}.json      — set-by-set detail (get_activity_exercise_sets)
+    Skips sessions already present in data/raw/.
+    """
+    logger.info(f"Scanning strength sessions from {start_date} to {end_date}...")
+    try:
+        activities = client.get_activities(0, 50)
+        strength = [
+            a for a in activities
+            if a.get("activityType", {}).get("typeKey") == "strength_training"
+            and start_date <= date.fromisoformat(a["startTimeLocal"][:10]) <= end_date
+        ]
+
+        if not strength:
+            logger.info("No strength sessions found in the specified date range.")
+            return
+
+        RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        for act in strength:
+            activity_id = act["activityId"]
+            start_time = act["startTimeLocal"][:10]
+
+            # Session-level summary — extract the fields we need from the activity list entry
+            session_file = RAW_DATA_DIR / f"strength_training_{start_time}_{activity_id}.json"
+            if not session_file.exists():
+                session = {
+                    "activity_id": activity_id,
+                    "date": start_time,
+                    "name": act.get("activityName"),
+                    "duration_sec": act.get("duration"),
+                    "moving_duration_sec": act.get("movingDuration"),
+                    "calories": act.get("calories"),
+                    "avg_hr": act.get("averageHR"),
+                    "max_hr": act.get("maxHR"),
+                    "total_sets": act.get("totalSets"),
+                    "active_sets": act.get("activeSets"),
+                    "total_reps": act.get("totalReps"),
+                    "training_load": act.get("activityTrainingLoad"),
+                    "body_battery_drain": act.get("differenceBodyBattery"),
+                    "aerobic_te": act.get("aerobicTrainingEffect"),
+                    "anaerobic_te": act.get("anaerobicTrainingEffect"),
+                    "training_effect_label": act.get("trainingEffectLabel"),
+                    "hr_time_in_zone_1": act.get("hrTimeInZone_1"),
+                    "hr_time_in_zone_2": act.get("hrTimeInZone_2"),
+                    "hr_time_in_zone_3": act.get("hrTimeInZone_3"),
+                    "hr_time_in_zone_4": act.get("hrTimeInZone_4"),
+                    "hr_time_in_zone_5": act.get("hrTimeInZone_5"),
+                    "summarized_exercise_sets": act.get("summarizedExerciseSets", []),
+                }
+                with open(session_file, "w") as f:
+                    json.dump(session, f, indent=2)
+                logger.info(f"Strength session saved: {session_file.name}")
+            else:
+                logger.info(f"Skipping strength session {activity_id} — already saved.")
+
+            # Set-by-set detail
+            sets_file = RAW_DATA_DIR / f"strength_sets_{start_time}_{activity_id}.json"
+            if not sets_file.exists():
+                try:
+                    sets_data = client.get_activity_exercise_sets(str(activity_id))
+                    with open(sets_file, "w") as f:
+                        json.dump({
+                            "activity_id": activity_id,
+                            "date": start_time,
+                            "exercise_sets": sets_data.get("exerciseSets", []),
+                        }, f, indent=2)
+                    logger.info(f"Strength sets saved: {sets_file.name}")
+                except Exception as e:
+                    logger.warning(f"Could not fetch exercise sets for {activity_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error extracting strength activities: {e}")
 
 
 def run_full_extraction() -> None:
@@ -301,6 +409,7 @@ def run_full_extraction() -> None:
         current += timedelta(days=1)
 
     extract_runs_in_range(client, last_extracted, today)
+    extract_strength_activities(client, last_extracted, today)
     extract_training_plan(client)
     extract_race_predictions(client)
     extract_weight_history(client, days=30)

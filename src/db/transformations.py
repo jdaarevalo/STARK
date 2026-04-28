@@ -193,6 +193,169 @@ def process_fit_files():
         logger.info(f"Run telemetry saved with {len(df)} rows to {output_path}")
 
 
+def process_strength_jsons():
+    """
+    Reads strength_training_*.json and strength_sets_*.json files and saves two Silver
+    Parquet files:
+      - silver_strength_sessions.parquet — one row per session
+      - silver_strength_sets.parquet     — one row per active exercise set
+    """
+    logger.info("Starting strength sessions processing...")
+
+    # ── Sessions ──────────────────────────────────────────────────────────────
+    session_files = glob.glob(str(RAW_DIR / "strength_training_*.json"))
+    if session_files:
+        sessions = []
+        for file in session_files:
+            with open(file) as f:
+                data = json.load(f)
+            total_zone_secs = sum(
+                data.get(f"hr_time_in_zone_{z}") or 0 for z in range(1, 6)
+            )
+            sessions.append({
+                "activity_id": str(data.get("activity_id")),
+                "date": data.get("date"),
+                "name": data.get("name"),
+                "duration_min": round((data.get("duration_sec") or 0) / 60, 1),
+                "active_min": round((data.get("moving_duration_sec") or 0) / 60, 1),
+                "calories": data.get("calories"),
+                "avg_hr": data.get("avg_hr"),
+                "max_hr": data.get("max_hr"),
+                "total_sets": data.get("total_sets"),
+                "active_sets": data.get("active_sets"),
+                "total_reps": data.get("total_reps"),
+                "training_load": data.get("training_load"),
+                "body_battery_drain": data.get("body_battery_drain"),
+                "aerobic_te": data.get("aerobic_te"),
+                "anaerobic_te": data.get("anaerobic_te"),
+                "training_effect_label": data.get("training_effect_label"),
+                "pct_z1": round(100.0 * (data.get("hr_time_in_zone_1") or 0) / total_zone_secs, 1) if total_zone_secs else None,
+                "pct_z2": round(100.0 * (data.get("hr_time_in_zone_2") or 0) / total_zone_secs, 1) if total_zone_secs else None,
+                "pct_z3": round(100.0 * (data.get("hr_time_in_zone_3") or 0) / total_zone_secs, 1) if total_zone_secs else None,
+                "pct_z4": round(100.0 * (data.get("hr_time_in_zone_4") or 0) / total_zone_secs, 1) if total_zone_secs else None,
+                "pct_z5": round(100.0 * (data.get("hr_time_in_zone_5") or 0) / total_zone_secs, 1) if total_zone_secs else None,
+            })
+        df = pd.DataFrame(sessions)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+        out = PROCESSED_DIR / "silver_strength_sessions.parquet"
+        df.to_parquet(out, index=False)
+        logger.info(f"Saved {len(df)} strength sessions to {out}")
+    else:
+        logger.warning("No strength session files found in raw.")
+
+    # ── Sets ──────────────────────────────────────────────────────────────────
+    sets_files = glob.glob(str(RAW_DIR / "strength_sets_*.json"))
+    if sets_files:
+        sets_rows = []
+        for file in sets_files:
+            with open(file) as f:
+                data = json.load(f)
+            activity_id = str(data.get("activity_id"))
+            act_date = data.get("date")
+            for s in data.get("exercise_sets", []):
+                if s.get("setType") != "ACTIVE":
+                    continue
+                exercises = s.get("exercises") or []
+                # De-duplicate: the watch logs one entry per rep detected; take the first unique name
+                seen = set()
+                unique_exercises = []
+                for ex in exercises:
+                    key = (ex.get("category"), ex.get("name"))
+                    if key not in seen:
+                        seen.add(key)
+                        unique_exercises.append(ex)
+                for ex in unique_exercises:
+                    sets_rows.append({
+                        "activity_id": activity_id,
+                        "date": act_date,
+                        "set_start_time": s.get("startTime"),
+                        "exercise_category": ex.get("category"),
+                        "exercise_name": ex.get("name"),
+                        "reps": s.get("repetitionCount"),
+                        "weight_kg": s.get("weight"),
+                        "duration_sec": s.get("duration"),
+                    })
+        if sets_rows:
+            df = pd.DataFrame(sets_rows)
+            df["date"] = pd.to_datetime(df["date"])
+            df["set_start_time"] = pd.to_datetime(df["set_start_time"], errors="coerce")
+            df = df.sort_values(["date", "set_start_time"])
+            out = PROCESSED_DIR / "silver_strength_sets.parquet"
+            df.to_parquet(out, index=False)
+            logger.info(f"Saved {len(df)} strength sets to {out}")
+        else:
+            logger.warning("No active exercise sets found in strength_sets files.")
+    else:
+        logger.warning("No strength sets files found in raw.")
+
+
+def process_hr_zones_jsons():
+    """
+    Reads hr_zones_{date}_{activity_id}.json files extracted from Garmin's hrTimeInZones
+    endpoint and saves consolidated Silver Parquet with Garmin's own zone percentages
+    and bpm boundaries per activity.
+    """
+    logger.info("Starting HR zones JSON processing...")
+    json_files = glob.glob(str(RAW_DIR / "hr_zones_*.json"))
+
+    if not json_files:
+        logger.warning("No HR zones files found in raw.")
+        return
+
+    records = []
+    for file in json_files:
+        with open(file, "r") as f:
+            data = json.load(f)
+
+        zones: dict = data.get("zones") or {}
+        if not zones:
+            continue
+
+        total_seconds = sum(
+            (z.get("seconds_in_zone") or 0) for z in zones.values()
+        )
+        if total_seconds == 0:
+            continue
+
+        def _pct(zone_num):
+            z = zones.get(zone_num) or zones.get(str(zone_num)) or {}
+            secs = z.get("seconds_in_zone") or 0
+            return round(100.0 * secs / total_seconds, 1)
+
+        def _boundary(zone_num):
+            z = zones.get(zone_num) or zones.get(str(zone_num)) or {}
+            return z.get("zone_low_boundary")
+
+        records.append({
+            "activity_id": str(data.get("activity_id")),
+            "date": data.get("date"),
+            "pct_z1": _pct(1),
+            "pct_z2": _pct(2),
+            "pct_z3": _pct(3),
+            "pct_z4": _pct(4),
+            "pct_z5": _pct(5),
+            "z1_low_bpm": _boundary(1),
+            "z2_low_bpm": _boundary(2),
+            "z3_low_bpm": _boundary(3),
+            "z4_low_bpm": _boundary(4),
+            "z5_low_bpm": _boundary(5),
+            "total_seconds_in_zones": total_seconds,
+        })
+
+    if not records:
+        logger.warning("No valid HR zone records to process.")
+        return
+
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+
+    output_path = PROCESSED_DIR / "silver_hr_zones.parquet"
+    df.to_parquet(output_path, index=False)
+    logger.info(f"Saved {len(df)} HR zone records to {output_path}")
+
+
 def process_weight_jsons():
     """Reads weight_history_*.json files and saves a consolidated Silver Parquet."""
     logger.info("Starting weight history processing...")
@@ -243,4 +406,6 @@ if __name__ == "__main__":
     process_hydration_jsons()
     process_weight_jsons()
     process_fit_files()
+    process_hr_zones_jsons()
+    process_strength_jsons()
     logger.info("Bronze -> Silver processing complete.")
